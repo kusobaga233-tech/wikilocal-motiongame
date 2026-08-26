@@ -1,0 +1,1 @@
+"""WikiLocal local knowledge base."""

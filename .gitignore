@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+data/documents/
+data/index/
+data/logs/
+models/
+
+config/settings.json
