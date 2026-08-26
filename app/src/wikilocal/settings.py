@@ -15,7 +15,7 @@ class Settings:
 
     @property
     def database_path(self) -> Path:
-        return self.root / "data" / "index" / "wikilocal.db"
+        return self.root / "data" / "index" / "wikilocal.sqlite3"
 
     @property
     def settings_path(self) -> Path:

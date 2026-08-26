@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,20 @@ from wikilocal.settings import Settings
 
 
 class SettingsTests(unittest.TestCase):
+    def test_repository_default_settings_are_tracked(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        settings_path = repository_root / "config" / "settings.json"
+
+        self.assertEqual(
+            json.loads(settings_path.read_text(encoding="utf-8")),
+            {
+                "daily_time": "02:00",
+                "documents_enabled": True,
+                "chats_enabled": True,
+                "chat_history_start": None,
+            },
+        )
+
     def test_load_creates_defaults_and_required_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -21,7 +36,10 @@ class SettingsTests(unittest.TestCase):
             self.assertTrue(settings.documents_enabled)
             self.assertTrue(settings.chats_enabled)
             self.assertIsNone(settings.chat_history_start)
-            self.assertEqual(settings.database_path, root / "data" / "index" / "wikilocal.db")
+            self.assertEqual(
+                settings.database_path,
+                root / "data" / "index" / "wikilocal.sqlite3",
+            )
             self.assertEqual(
                 (root / "config" / "settings.json").read_text(encoding="utf-8"),
                 "{\n  \"daily_time\": \"02:00\",\n  \"documents_enabled\": true,\n"
