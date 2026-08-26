@@ -97,3 +97,41 @@ class StorageTests(unittest.TestCase):
             },
         )
         self.assertEqual(checkpoint_columns, {"checkpoint_key", "cursor_json", "updated_at"})
+
+    def test_chunks_fts_has_expected_column_order_and_unindexed_columns(self) -> None:
+        storage = self.make_storage()
+
+        with closing(sqlite3.connect(storage.database_path)) as connection:
+            column_names = [row[1] for row in connection.execute("PRAGMA table_info(chunks_fts)")]
+            definition = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = ?",
+                ("chunks_fts",),
+            ).fetchone()[0]
+
+        self.assertEqual(column_names, ["chunk_id", "text_content", "title", "source_key"])
+        self.assertIn("chunk_id UNINDEXED", definition)
+        self.assertIn("source_key UNINDEXED", definition)
+
+    def test_metadata_json_is_stable_regardless_of_mapping_key_order(self) -> None:
+        storage = self.make_storage()
+        first = {"z": 3, "nested": {"b": 2, "a": 1}, "a": 0}
+        second = {"a": 0, "nested": {"a": 1, "b": 2}, "z": 3}
+
+        storage.upsert_source(
+            SourceRecord("document:d1", "document", "Title", "Body", first, True)
+        )
+        with closing(sqlite3.connect(storage.database_path)) as connection:
+            first_json = connection.execute(
+                "SELECT metadata_json FROM sources WHERE source_key = ?", ("document:d1",)
+            ).fetchone()[0]
+
+        storage.upsert_source(
+            SourceRecord("document:d1", "document", "Title", "Body", second, True)
+        )
+        with closing(sqlite3.connect(storage.database_path)) as connection:
+            second_json = connection.execute(
+                "SELECT metadata_json FROM sources WHERE source_key = ?", ("document:d1",)
+            ).fetchone()[0]
+
+        self.assertEqual(first_json, '{"a":0,"nested":{"a":1,"b":2},"z":3}')
+        self.assertEqual(second_json, first_json)
