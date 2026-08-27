@@ -130,3 +130,48 @@ Captured result:
 ```text
 41 passed, 65 subtests passed in 0.30s
 ```
+
+## Legacy Checkpoint Migration RED
+
+Before adding legacy checkpoint compatibility, the regression tests were added
+and run from `D:\\wikilocal\\app`:
+
+```powershell
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_sync_chats.py -v
+```
+
+Captured result:
+
+```text
+FAILED test_legacy_checkpoint_discovers_old_thread_and_stores_new_reply_once
+AssertionError: (0, 0) != (1, 0)
+
+FAILED test_legacy_discovery_failure_keeps_checkpoint_unmigrated
+AssertionError: [('oc-1', None, '2026-08-26T01:00:00Z')]
+!= [('oc-1', None, None)]
+```
+
+The old checkpoint format did not trigger a full root-message discovery, so an
+old thread could not be found and a discovery failure could not prevent normal
+incremental processing.
+
+## Legacy Checkpoint Migration GREEN
+
+An old checkpoint with a main-message cursor but no `thread_ids` now first
+performs a paginated, read-only root discovery without a `start` value. It
+only collects thread IDs. The normal main-message scan and every known-thread
+scan must then complete before the same checkpoint write records the discovered
+IDs and `thread_discovery_complete: true`. A failed discovery leaves the old
+cursor and migration marker unchanged.
+
+Targeted verification:
+
+```powershell
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_sync_chats.py -v
+```
+
+Captured result:
+
+```text
+7 passed in 0.12s
+```

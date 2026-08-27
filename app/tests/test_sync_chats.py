@@ -17,6 +17,8 @@ class FakeChatFeishu:
         self.chats = [{"chat_id": "oc-1", "name": "Roadmap", "chat_mode": "group"}]
         self.pages: dict[str | None, dict[str, object]] = {}
         self.pages_by_chat: dict[tuple[str, str | None], dict[str, object]] = {}
+        self.pages_by_request: dict[tuple[str, str | None, str | None], dict[str, object]] = {}
+        self.message_errors_by_request: dict[tuple[str, str | None, str | None], Exception] = {}
         self.thread_pages: dict[tuple[str, str | None], dict[str, object]] = {}
         self.message_calls: list[tuple[str, str | None, str | None]] = []
 
@@ -34,6 +36,11 @@ class FakeChatFeishu:
     ) -> dict[str, object]:
         assert end is None
         self.message_calls.append((chat_id, page_token, start))
+        request = (chat_id, page_token, start)
+        if request in self.message_errors_by_request:
+            raise self.message_errors_by_request[request]
+        if self.pages_by_request:
+            return self.pages_by_request[request]
         if self.pages_by_chat:
             return self.pages_by_chat[(chat_id, page_token)]
         return self.pages[page_token]
@@ -226,6 +233,69 @@ class ChatSynchronizerTests(unittest.TestCase):
             },
         )
         self.assertEqual(feishu.message_calls[-1], ("oc-1", None, "2026-08-26T01:00:00Z"))
+
+    def test_legacy_checkpoint_discovers_old_thread_and_stores_new_reply_once(self) -> None:
+        settings, storage = self.make_storage()
+        storage.set_checkpoint(
+            "chat:oc-1",
+            {"message_id": "m1", "sent_at": "2026-08-26T01:00:00Z"},
+        )
+        feishu = FakeChatFeishu()
+        feishu.pages_by_request = {
+            ("oc-1", None, None): {
+                "messages": [text_message("m1", "2026-08-26T01:00:00Z", "Old root", thread_id="omt-1")],
+                "has_more": False,
+            },
+            ("oc-1", None, "2026-08-26T01:00:00Z"): {
+                "messages": [],
+                "has_more": False,
+            },
+        }
+        feishu.thread_pages = {
+            ("omt-1", None): {
+                "messages": [text_message("m2", "2026-08-26T02:00:00Z", "New reply")],
+                "has_more": False,
+            }
+        }
+        synchronizer = ChatSynchronizer(settings, storage, feishu)
+
+        result = synchronizer.sync()
+
+        self.assertEqual((result.created, result.failed), (1, 0))
+        self.assertEqual(
+            storage.get_checkpoint("chat:oc-1"),
+            {
+                "message_id": "m1",
+                "sent_at": "2026-08-26T01:00:00Z",
+                "thread_ids": ["omt-1"],
+                "thread_discovery_complete": True,
+            },
+        )
+        self.assertEqual(
+            feishu.message_calls,
+            [("oc-1", None, None), ("oc-1", None, "2026-08-26T01:00:00Z")],
+        )
+
+        feishu.message_calls.clear()
+        feishu.thread_pages = {("omt-1", None): {"messages": [], "has_more": False}}
+
+        second_result = synchronizer.sync()
+
+        self.assertEqual((second_result.created, second_result.failed), (0, 0))
+        self.assertEqual(feishu.message_calls, [("oc-1", None, "2026-08-26T01:00:00Z")])
+
+    def test_legacy_discovery_failure_keeps_checkpoint_unmigrated(self) -> None:
+        settings, storage = self.make_storage()
+        legacy_checkpoint = {"message_id": "m1", "sent_at": "2026-08-26T01:00:00Z"}
+        storage.set_checkpoint("chat:oc-1", legacy_checkpoint)
+        feishu = FakeChatFeishu()
+        feishu.message_errors_by_request[("oc-1", None, None)] = RuntimeError("network failure")
+
+        result = ChatSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual((result.created, result.failed), (0, 1))
+        self.assertEqual(storage.get_checkpoint("chat:oc-1"), legacy_checkpoint)
+        self.assertEqual(feishu.message_calls, [("oc-1", None, None)])
 
     def test_sync_includes_p2p_and_muted_chats_returned_by_read_only_enumeration(self) -> None:
         settings, storage = self.make_storage()
