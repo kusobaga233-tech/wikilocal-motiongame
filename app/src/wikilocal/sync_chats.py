@@ -50,6 +50,7 @@ class ChatSynchronizer:
         existing = {source.source_key: source for source in self._storage.list_sources()}
         cursor = self._storage.get_checkpoint(f"chat:{chat_id}")
         start = _cursor_time(cursor) or self._settings.chat_history_start
+        thread_ids = _cursor_thread_ids(cursor)
         result = SyncResult()
         latest: tuple[str, str] | None = None
         page_token: str | None = None
@@ -65,20 +66,20 @@ class ChatSynchronizer:
                 latest = _newer(latest, candidate)
                 thread_id = _text(message.get("thread_id"))
                 if thread_id:
-                    thread_result, _ = self._sync_thread(
-                        thread_id, chat_id, chat_name, existing
-                    )
-                    result = _add_results(result, thread_result)
+                    thread_ids.add(thread_id)
             if not has_more:
                 break
             if not next_token:
                 raise ValueError("Feishu message page is missing its next page token.")
             page_token = next_token
 
-        if latest is not None:
-            self._storage.set_checkpoint(
-                f"chat:{chat_id}", {"message_id": latest[1], "sent_at": latest[0]}
-            )
+        for thread_id in sorted(thread_ids):
+            thread_result, _ = self._sync_thread(thread_id, chat_id, chat_name, existing)
+            result = _add_results(result, thread_result)
+
+        checkpoint = _chat_checkpoint(cursor, latest, thread_ids)
+        if checkpoint is not None:
+            self._storage.set_checkpoint(f"chat:{chat_id}", checkpoint)
         return result
 
     def _sync_thread(
@@ -216,6 +217,34 @@ def _chat_name(chat: dict[str, Any]) -> str:
 
 def _cursor_time(cursor: Any) -> str | None:
     return _text(cursor.get("sent_at")) or None if isinstance(cursor, dict) else None
+
+
+def _cursor_thread_ids(cursor: Any) -> set[str]:
+    if not isinstance(cursor, dict):
+        return set()
+    values = cursor.get("thread_ids")
+    if not isinstance(values, list):
+        return set()
+    return {_text(value) for value in values if _text(value)}
+
+
+def _chat_checkpoint(
+    cursor: Any, latest: tuple[str, str] | None, thread_ids: set[str]
+) -> dict[str, Any] | None:
+    previous = cursor if isinstance(cursor, dict) else {}
+    sent_at = latest[0] if latest is not None else _text(previous.get("sent_at"))
+    message_id = latest[1] if latest is not None else _text(previous.get("message_id"))
+    if not sent_at and not message_id and not thread_ids:
+        return None
+
+    checkpoint: dict[str, Any] = {}
+    if sent_at:
+        checkpoint["sent_at"] = sent_at
+    if message_id:
+        checkpoint["message_id"] = message_id
+    if thread_ids:
+        checkpoint["thread_ids"] = sorted(thread_ids)
+    return checkpoint
 
 
 def _newer(

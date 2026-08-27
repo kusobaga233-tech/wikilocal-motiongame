@@ -161,8 +161,71 @@ class ChatSynchronizerTests(unittest.TestCase):
 
         self.assertEqual(
             storage.get_checkpoint("chat:oc-1"),
-            {"message_id": "m1", "sent_at": "2026-08-26T01:00:00Z"},
+            {
+                "message_id": "m1",
+                "sent_at": "2026-08-26T01:00:00Z",
+                "thread_ids": ["omt-1"],
+            },
         )
+
+    def test_second_sync_reads_new_reply_from_known_thread_without_new_root_message(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeChatFeishu()
+        feishu.pages = {
+            None: {
+                "messages": [
+                    text_message("m1", "2026-08-26T01:00:00Z", "Root", thread_id="omt-1")
+                ],
+                "has_more": False,
+            }
+        }
+        feishu.thread_pages = {
+            ("omt-1", None): {"messages": [], "has_more": False},
+        }
+        synchronizer = ChatSynchronizer(settings, storage, feishu)
+
+        first_result = synchronizer.sync()
+
+        self.assertEqual((first_result.created, first_result.failed), (1, 0))
+        self.assertEqual(
+            storage.get_checkpoint("chat:oc-1"),
+            {
+                "message_id": "m1",
+                "sent_at": "2026-08-26T01:00:00Z",
+                "thread_ids": ["omt-1"],
+            },
+        )
+
+        feishu.pages = {None: {"messages": [], "has_more": False}}
+        feishu.thread_pages = {
+            ("omt-1", None): {
+                "messages": [
+                    text_message("m1", "2026-08-26T01:00:00Z", "Root"),
+                    text_message("m2", "2026-08-26T02:00:00Z", "New reply"),
+                ],
+                "has_more": False,
+            },
+        }
+
+        second_result = synchronizer.sync()
+
+        self.assertEqual(
+            (second_result.created, second_result.changed, second_result.skipped, second_result.failed),
+            (1, 0, 1, 0),
+        )
+        self.assertEqual(
+            [source.source_key for source in storage.list_sources(active_only=True)],
+            ["message:m1", "message:m2"],
+        )
+        self.assertEqual(
+            storage.get_checkpoint("chat:oc-1"),
+            {
+                "message_id": "m1",
+                "sent_at": "2026-08-26T01:00:00Z",
+                "thread_ids": ["omt-1"],
+            },
+        )
+        self.assertEqual(feishu.message_calls[-1], ("oc-1", None, "2026-08-26T01:00:00Z"))
 
     def test_sync_includes_p2p_and_muted_chats_returned_by_read_only_enumeration(self) -> None:
         settings, storage = self.make_storage()

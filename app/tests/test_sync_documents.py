@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -85,8 +86,16 @@ class DocumentSynchronizerTests(unittest.TestCase):
         self.assertEqual(result.created, 1)
         self.assertEqual(result.changed, 0)
         self.assertEqual(result.failed, 0)
+        content_hash = hashlib.sha256("First line\nSecond line\n".encode("utf-8")).hexdigest()
         self.assertEqual(
             (settings.root / "data" / "documents" / "document-d1.md").read_text(encoding="utf-8"),
+            "---\n"
+            "source_key: \"document:d1\"\n"
+            "url: \"https://example.test/wiki/node-d1\"\n"
+            "wiki_path: \"Product / Engineering / Release plan\"\n"
+            "source_updated_at: \"2026-08-26T02:00:00Z\"\n"
+            f"content_hash: \"{content_hash}\"\n"
+            "---\n\n"
             "# Release plan\n\nFirst line\nSecond line\n",
         )
         source = storage.list_sources(active_only=True)[0]
@@ -108,8 +117,16 @@ class DocumentSynchronizerTests(unittest.TestCase):
         result = synchronizer.sync()
 
         self.assertEqual((result.created, result.changed, result.skipped, result.failed), (0, 1, 0, 0))
+        content_hash = hashlib.sha256("Revised body\n".encode("utf-8")).hexdigest()
         self.assertEqual(
             (settings.root / "data" / "documents" / "document-d1.md").read_text(encoding="utf-8"),
+            "---\n"
+            "source_key: \"document:d1\"\n"
+            "url: \"https://example.test/wiki/node-d1\"\n"
+            "wiki_path: \"Product / Engineering / Release plan\"\n"
+            "source_updated_at: \"2026-08-27T02:00:00Z\"\n"
+            f"content_hash: \"{content_hash}\"\n"
+            "---\n\n"
             "# Release plan\n\nRevised body\n",
         )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -94,7 +96,7 @@ class DocumentSynchronizer:
                         active=True,
                     )
                     outcome = _outcome(existing.get(source_key), source)
-                    self._write_mirror(token, title, content)
+                    self._write_mirror(token, source)
                     self._storage.upsert_source(source)
                     existing[source_key] = source
                     result = result.add(**{outcome: 1})
@@ -128,9 +130,24 @@ class DocumentSynchronizer:
         visit(None, (space_name,))
         return result
 
-    def _write_mirror(self, token: str, title: str, content: str) -> None:
+    def _write_mirror(self, token: str, source: SourceRecord) -> None:
         mirror = self._settings.root / "data" / "documents" / f"document-{token}.md"
-        mirror.write_text(f"# {title}\n\n{content}", encoding="utf-8", newline="\n")
+        metadata = source.metadata
+        provenance = {
+            "source_key": source.source_key,
+            "url": metadata.get("url"),
+            "wiki_path": metadata.get("wiki_path"),
+            "source_updated_at": metadata.get("source_updated_at"),
+            "content_hash": _content_hash(source.text_content),
+        }
+        front_matter = "\n".join(
+            f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in provenance.items()
+        )
+        mirror.write_text(
+            f"---\n{front_matter}\n---\n\n# {source.title}\n\n{source.text_content}",
+            encoding="utf-8",
+            newline="\n",
+        )
 
 
 def _pages(fetch: Any) -> list[dict[str, Any]]:
@@ -189,6 +206,10 @@ def _text(value: Any) -> str:
 
 def _document_url(token: str) -> str:
     return f"https://feishu.cn/docx/{token}"
+
+
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _now() -> str:
