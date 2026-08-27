@@ -131,10 +131,11 @@ class DocumentSynchronizer:
         return result
 
     def _write_mirror(self, token: str, source: SourceRecord) -> None:
-        mirror = self._settings.root / "data" / "documents" / f"document-{token}.md"
+        mirror = self._settings.root / "data" / "documents" / f"document-{_token_digest(token)}.md"
         metadata = source.metadata
         provenance = {
             "source_key": source.source_key,
+            "document_token": token,
             "url": metadata.get("url"),
             "wiki_path": metadata.get("wiki_path"),
             "source_updated_at": metadata.get("source_updated_at"),
@@ -153,6 +154,7 @@ class DocumentSynchronizer:
 def _pages(fetch: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     page_token: str | None = None
+    seen_page_tokens: set[str] = set()
     while True:
         page = fetch(page_token=page_token)
         if not isinstance(page, dict):
@@ -166,6 +168,9 @@ def _pages(fetch: Any) -> list[dict[str, Any]]:
         next_token = _text(page.get("page_token"))
         if not next_token:
             raise ValueError("Feishu pagination response is missing its next page token.")
+        if next_token in seen_page_tokens:
+            raise ValueError("Feishu pagination response repeated a page token.")
+        seen_page_tokens.add(next_token)
         page_token = next_token
 
 
@@ -210,6 +215,10 @@ def _document_url(token: str) -> str:
 
 def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _now() -> str:

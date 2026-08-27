@@ -175,3 +175,52 @@ Captured result:
 ```text
 7 passed in 0.12s
 ```
+
+## Pagination and Mirror Filename Review RED
+
+Before changing the Task 3 synchronizers, regression coverage was added for a
+repeated non-empty page token in document, chat enumeration, main-message,
+legacy thread-discovery, and thread-reply pagination. The document tests also
+specified a token containing Windows-reserved/path characters. The targeted
+suite was run from `D:\\wikilocal\\app`:
+
+```powershell
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_sync_documents.py tests\\test_sync_chats.py -v
+```
+
+Captured result:
+
+```text
+FAILED test_repeated_document_page_token_fails_without_advancing_checkpoint
+FAILED test_repeated_chat_enumeration_page_token_fails_without_changing_checkpoint
+FAILED test_repeated_chat_page_token_fails_without_changing_existing_checkpoint
+FAILED test_repeated_legacy_discovery_page_token_fails_without_migrating_checkpoint
+FAILED test_repeated_thread_reply_page_token_fails_without_changing_checkpoint
+FAILED test_unsafe_document_token_uses_stable_digest_mirror_name_and_preserves_token
+```
+
+The repeated page token was accepted as normal pagination, so no failure was
+reported and the synchronizers could continue indefinitely with a real API.
+The unsafe token could not be used as a Windows filename.
+
+## Pagination and Mirror Filename Review GREEN
+
+Every Task 3 pagination loop now tracks non-empty response page tokens and
+raises `ValueError("Feishu pagination response repeated a page token.")` on a
+repeat before a checkpoint is written. Mirror filenames are now
+`document-<sha256(token)>.md`; front matter retains both `source_key` and the
+original `document_token`.
+
+Targeted verification from `D:\\wikilocal\\app`:
+
+```powershell
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_sync_documents.py tests\\test_sync_chats.py -v
+```
+
+Captured result:
+
+```text
+17 passed in 0.26s
+```
+
+No real Feishu synchronization was run for this review.

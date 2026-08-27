@@ -21,8 +21,11 @@ class FakeChatFeishu:
         self.message_errors_by_request: dict[tuple[str, str | None, str | None], Exception] = {}
         self.thread_pages: dict[tuple[str, str | None], dict[str, object]] = {}
         self.message_calls: list[tuple[str, str | None, str | None]] = []
+        self.chat_pages: dict[str | None, dict[str, object]] = {}
 
     def list_chats(self, *, page_token: str | None = None) -> dict[str, object]:
+        if self.chat_pages:
+            return self.chat_pages[page_token]
         assert page_token is None
         return {"items": self.chats}
 
@@ -322,3 +325,112 @@ class ChatSynchronizerTests(unittest.TestCase):
             {source.metadata["chat_name"] for source in storage.list_sources(active_only=True)},
             {"Muted group", "Direct chat"},
         )
+
+    def test_repeated_chat_page_token_fails_without_changing_existing_checkpoint(self) -> None:
+        settings, storage = self.make_storage()
+        checkpoint = {
+            "message_id": "m1",
+            "sent_at": "2026-08-26T01:00:00Z",
+            "thread_ids": [],
+        }
+        storage.set_checkpoint("chat:oc-1", checkpoint)
+        feishu = FakeChatFeishu()
+        calls = 0
+
+        def list_messages(
+            chat_id: str, *, page_token: str | None = None, start: str | None = None, end: str | None = None
+        ) -> dict[str, object]:
+            nonlocal calls
+            self.assertEqual((chat_id, start, end), ("oc-1", "2026-08-26T01:00:00Z", None))
+            calls += 1
+            return (
+                {"messages": [], "has_more": True, "page_token": "loop"}
+                if calls < 3
+                else {"messages": [], "has_more": False}
+            )
+
+        feishu.list_messages = list_messages  # type: ignore[method-assign]
+
+        result = ChatSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(storage.get_checkpoint("chat:oc-1"), checkpoint)
+
+    def test_repeated_legacy_discovery_page_token_fails_without_migrating_checkpoint(self) -> None:
+        settings, storage = self.make_storage()
+        checkpoint = {"message_id": "m1", "sent_at": "2026-08-26T01:00:00Z"}
+        storage.set_checkpoint("chat:oc-1", checkpoint)
+        feishu = FakeChatFeishu()
+        calls = 0
+
+        def list_messages(
+            chat_id: str, *, page_token: str | None = None, start: str | None = None, end: str | None = None
+        ) -> dict[str, object]:
+            nonlocal calls
+            self.assertEqual((chat_id, end), ("oc-1", None))
+            if start is not None:
+                self.assertEqual(start, "2026-08-26T01:00:00Z")
+                return {"messages": [], "has_more": False}
+            calls += 1
+            return {"messages": [], "has_more": True, "page_token": "loop"} if calls < 3 else {"messages": [], "has_more": False}
+
+        feishu.list_messages = list_messages  # type: ignore[method-assign]
+
+        result = ChatSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(storage.get_checkpoint("chat:oc-1"), checkpoint)
+
+    def test_repeated_thread_reply_page_token_fails_without_changing_checkpoint(self) -> None:
+        settings, storage = self.make_storage()
+        checkpoint = {
+            "message_id": "m1",
+            "sent_at": "2026-08-26T01:00:00Z",
+            "thread_ids": ["omt-1"],
+        }
+        storage.set_checkpoint("chat:oc-1", checkpoint)
+        feishu = FakeChatFeishu()
+        feishu.pages_by_request = {
+            ("oc-1", None, "2026-08-26T01:00:00Z"): {"messages": [], "has_more": False},
+        }
+        calls = 0
+
+        def list_thread_messages(thread_id: str, *, page_token: str | None = None) -> dict[str, object]:
+            nonlocal calls
+            self.assertEqual(thread_id, "omt-1")
+            calls += 1
+            return (
+                {"messages": [], "has_more": True, "page_token": "loop"}
+                if calls < 3
+                else {"messages": [], "has_more": False}
+            )
+
+        feishu.list_thread_messages = list_thread_messages  # type: ignore[method-assign]
+
+        result = ChatSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(storage.get_checkpoint("chat:oc-1"), checkpoint)
+
+    def test_repeated_chat_enumeration_page_token_fails_without_changing_checkpoint(self) -> None:
+        settings, storage = self.make_storage()
+        checkpoint = {"message_id": "m1", "sent_at": "2026-08-26T01:00:00Z"}
+        storage.set_checkpoint("chat:oc-1", checkpoint)
+        feishu = FakeChatFeishu()
+        calls = 0
+
+        def list_chats(*, page_token: str | None = None) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return (
+                {"items": [], "has_more": True, "page_token": "loop"}
+                if calls < 3
+                else {"items": [], "has_more": False}
+            )
+
+        feishu.list_chats = list_chats  # type: ignore[method-assign]
+
+        result = ChatSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(storage.get_checkpoint("chat:oc-1"), checkpoint)

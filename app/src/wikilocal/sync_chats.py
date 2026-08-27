@@ -55,6 +55,7 @@ class ChatSynchronizer:
         result = SyncResult()
         latest: tuple[str, str] | None = None
         page_token: str | None = None
+        seen_page_tokens: set[str] = set()
 
         if migrated_thread_discovery:
             thread_ids.update(self._discover_thread_ids(chat_id))
@@ -75,6 +76,7 @@ class ChatSynchronizer:
                 break
             if not next_token:
                 raise ValueError("Feishu message page is missing its next page token.")
+            _ensure_new_page_token(next_token, seen_page_tokens)
             page_token = next_token
 
         for thread_id in sorted(thread_ids):
@@ -94,6 +96,7 @@ class ChatSynchronizer:
     def _discover_thread_ids(self, chat_id: str) -> set[str]:
         thread_ids: set[str] = set()
         page_token: str | None = None
+        seen_page_tokens: set[str] = set()
         while True:
             page = self._feishu.list_messages(chat_id, page_token=page_token)
             messages, has_more, next_token = _message_page(page)
@@ -106,6 +109,7 @@ class ChatSynchronizer:
                 return thread_ids
             if not next_token:
                 raise ValueError("Feishu message page is missing its next page token.")
+            _ensure_new_page_token(next_token, seen_page_tokens)
             page_token = next_token
 
     def _sync_thread(
@@ -118,6 +122,7 @@ class ChatSynchronizer:
         result = SyncResult()
         latest: tuple[str, str] | None = None
         page_token: str | None = None
+        seen_page_tokens: set[str] = set()
         while True:
             page = self._feishu.list_thread_messages(thread_id, page_token=page_token)
             messages, has_more, next_token = _message_page(page)
@@ -135,6 +140,7 @@ class ChatSynchronizer:
                 return result, latest
             if not next_token:
                 raise ValueError("Feishu thread page is missing its next page token.")
+            _ensure_new_page_token(next_token, seen_page_tokens)
             page_token = next_token
 
     def _store_message(
@@ -181,6 +187,7 @@ class ChatSynchronizer:
 def _chat_pages(fetch: Any) -> list[dict[str, Any]]:
     chats: list[dict[str, Any]] = []
     page_token: str | None = None
+    seen_page_tokens: set[str] = set()
     while True:
         page = fetch(page_token=page_token)
         if not isinstance(page, dict):
@@ -194,6 +201,7 @@ def _chat_pages(fetch: Any) -> list[dict[str, Any]]:
         page_token = _text(page.get("page_token"))
         if not page_token:
             raise ValueError("Feishu chat page is missing its next page token.")
+        _ensure_new_page_token(page_token, seen_page_tokens)
 
 
 def _message_page(page: Any) -> tuple[list[dict[str, Any]], bool, str | None]:
@@ -207,6 +215,12 @@ def _message_page(page: Any) -> tuple[list[dict[str, Any]], bool, str | None]:
         bool(page.get("has_more")),
         _text(page.get("page_token")) or None,
     )
+
+
+def _ensure_new_page_token(page_token: str, seen_page_tokens: set[str]) -> None:
+    if page_token in seen_page_tokens:
+        raise ValueError("Feishu pagination response repeated a page token.")
+    seen_page_tokens.add(page_token)
 
 
 def _message_text(message: dict[str, Any]) -> str:

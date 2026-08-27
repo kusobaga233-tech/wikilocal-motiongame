@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -88,9 +89,10 @@ class DocumentSynchronizerTests(unittest.TestCase):
         self.assertEqual(result.failed, 0)
         content_hash = hashlib.sha256("First line\nSecond line\n".encode("utf-8")).hexdigest()
         self.assertEqual(
-            (settings.root / "data" / "documents" / "document-d1.md").read_text(encoding="utf-8"),
+            self.mirror_path(settings, "d1").read_text(encoding="utf-8"),
             "---\n"
             "source_key: \"document:d1\"\n"
+            "document_token: \"d1\"\n"
             "url: \"https://example.test/wiki/node-d1\"\n"
             "wiki_path: \"Product / Engineering / Release plan\"\n"
             "source_updated_at: \"2026-08-26T02:00:00Z\"\n"
@@ -119,9 +121,10 @@ class DocumentSynchronizerTests(unittest.TestCase):
         self.assertEqual((result.created, result.changed, result.skipped, result.failed), (0, 1, 0, 0))
         content_hash = hashlib.sha256("Revised body\n".encode("utf-8")).hexdigest()
         self.assertEqual(
-            (settings.root / "data" / "documents" / "document-d1.md").read_text(encoding="utf-8"),
+            self.mirror_path(settings, "d1").read_text(encoding="utf-8"),
             "---\n"
             "source_key: \"document:d1\"\n"
+            "document_token: \"d1\"\n"
             "url: \"https://example.test/wiki/node-d1\"\n"
             "wiki_path: \"Product / Engineering / Release plan\"\n"
             "source_updated_at: \"2026-08-27T02:00:00Z\"\n"
@@ -179,3 +182,50 @@ class DocumentSynchronizerTests(unittest.TestCase):
         sources = {source.source_key: source for source in storage.list_sources()}
         self.assertFalse(sources["document:d2"].active)
         self.assertIsNotNone(storage.get_checkpoint("documents"))
+
+    def test_repeated_document_page_token_fails_without_advancing_checkpoint(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        synchronizer = DocumentSynchronizer(settings, storage, feishu)
+        synchronizer.sync()
+        checkpoint = storage.get_checkpoint("documents")
+        calls = 0
+
+        def list_wiki_spaces(*, page_token: str | None = None) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return {"items": [], "has_more": True, "page_token": "loop"}
+            return {"items": [], "has_more": False}
+
+        feishu.list_wiki_spaces = list_wiki_spaces  # type: ignore[method-assign]
+
+        result = synchronizer.sync()
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(storage.get_checkpoint("documents"), checkpoint)
+
+    def test_unsafe_document_token_uses_stable_digest_mirror_name_and_preserves_token(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        unsafe_token = "CON:/folder\\plan"
+        feishu.nodes[1]["obj_token"] = unsafe_token
+        feishu.documents[unsafe_token] = feishu.documents.pop("d1")
+
+        result = DocumentSynchronizer(settings, storage, feishu).sync()
+
+        mirror = self.mirror_path(settings, unsafe_token)
+        mirrors_root = (settings.root / "data" / "documents").resolve()
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(mirror.parent.resolve(), mirrors_root)
+        self.assertTrue(mirror.is_file())
+        self.assertEqual(mirror.name, f"document-{hashlib.sha256(unsafe_token.encode('utf-8')).hexdigest()}.md")
+        content = mirror.read_text(encoding="utf-8")
+        self.assertIn(f"source_key: {json.dumps(f'document:{unsafe_token}')}", content)
+        self.assertIn(f"document_token: {json.dumps(unsafe_token)}", content)
+        self.assertEqual(storage.list_sources(active_only=True)[0].source_key, f"document:{unsafe_token}")
+
+    @staticmethod
+    def mirror_path(settings: Settings, token: str) -> Path:
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return settings.root / "data" / "documents" / f"document-{digest}.md"
