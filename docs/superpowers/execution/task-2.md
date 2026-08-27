@@ -36,3 +36,25 @@ Captured result:
 ```text
 =================== 29 passed, 29 subtests passed ====================
 ```
+
+## Process Boundary Remediation Evidence
+
+Before changing `feishu.py`, the following command was run from
+`D:\\wikilocal\\app` after adding timeout, nonzero-exit, and control-character
+regression tests:
+
+```powershell
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_feishu.py -v
+```
+
+Captured RED result: the three new tests failed because `TimeoutExpired` was
+not wrapped, a nonzero CLI exit could return a JSON payload, and NUL/newline/
+tab values reached the injected command runner.
+
+After adding a 60-second CLI timeout, sanitized timeout/startup/exit errors,
+and control-character validation for every user-supplied command parameter,
+the same command was run again:
+
+```text
+=================== 16 passed, 48 subtests passed ====================
+```

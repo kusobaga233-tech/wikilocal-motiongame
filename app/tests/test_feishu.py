@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -307,3 +308,72 @@ class FeishuClientTests(unittest.TestCase):
         result = client.permission_preflight()
 
         self.assertEqual(result.missing_scopes, ())
+
+    def test_cli_timeout_raises_a_sanitized_error_without_process_output(self) -> None:
+        timeout = subprocess.TimeoutExpired(
+            cmd=("lark-cli", "wiki", "+space-list"),
+            timeout=1,
+            output="stdout-secret",
+            stderr="stderr-secret",
+        )
+
+        with (
+            patch("wikilocal.feishu.resolve_lark_cli_executable", return_value="lark-cli.cmd"),
+            patch("wikilocal.feishu.subprocess.run", side_effect=timeout) as run,
+            self.assertRaisesRegex(FeishuClientError, "timed out") as raised,
+        ):
+            FeishuClient._FeishuClient__run_lark_cli(
+                ("lark-cli", "wiki", "+space-list", "--as", "user", "--format", "json")
+            )
+
+        self.assertNotIn("stdout-secret", str(raised.exception))
+        self.assertNotIn("stderr-secret", str(raised.exception))
+        self.assertEqual(run.call_args.kwargs["timeout"], feishu.LARK_CLI_TIMEOUT_SECONDS)
+
+    def test_cli_nonzero_exit_raises_even_when_stdout_claims_success(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=("lark-cli.cmd", "wiki", "+space-list"),
+            returncode=1,
+            stdout=json.dumps({"ok": True, "data": {"items": []}}),
+            stderr="credential-secret",
+        )
+
+        with (
+            patch("wikilocal.feishu.resolve_lark_cli_executable", return_value="lark-cli.cmd"),
+            patch("wikilocal.feishu.subprocess.run", return_value=completed),
+            self.assertRaisesRegex(FeishuClientError, "execution failed") as raised,
+        ):
+            FeishuClient._FeishuClient__run_lark_cli(
+                ("lark-cli", "wiki", "+space-list", "--as", "user", "--format", "json")
+            )
+
+        self.assertNotIn("credential-secret", str(raised.exception))
+
+    def test_all_user_supplied_parameters_reject_control_characters_before_runner(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        client = FeishuClient(
+            runner=lambda command: calls.append(command) or json.dumps({"ok": True, "data": {}})
+        )
+        invalid_values = ("bad\x00value", "bad\nvalue", "bad\tvalue")
+        invocations = (
+            lambda value: client.list_chats(page_token=value),
+            lambda value: client.list_messages(value),
+            lambda value: client.list_messages("oc_1", page_token=value),
+            lambda value: client.list_messages("oc_1", start=value),
+            lambda value: client.list_messages("oc_1", end=value),
+            lambda value: client.list_thread_messages(value),
+            lambda value: client.list_thread_messages("omt_1", page_token=value),
+            lambda value: client.list_wiki_spaces(page_token=value),
+            lambda value: client.list_wiki_nodes(value),
+            lambda value: client.list_wiki_nodes("space_1", parent_node_token=value),
+            lambda value: client.list_wiki_nodes("space_1", page_token=value),
+            lambda value: client.read_document(value),
+        )
+
+        for invalid_value in invalid_values:
+            for invoke in invocations:
+                with self.subTest(value=repr(invalid_value), invocation=invocations.index(invoke)):
+                    with self.assertRaisesRegex(FeishuClientError, "invalid identifier"):
+                        invoke(invalid_value)
+
+        self.assertEqual(calls, [])

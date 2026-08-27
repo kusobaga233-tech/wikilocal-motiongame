@@ -4,12 +4,14 @@ import json
 import os
 import shutil
 import subprocess
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 
 _CommandRunner = Callable[[tuple[str, ...]], str]
+LARK_CLI_TIMEOUT_SECONDS = 60
 
 
 class FeishuClientError(RuntimeError):
@@ -268,15 +270,23 @@ class FeishuClient:
 
     @staticmethod
     def __run_lark_cli(command: tuple[str, ...]) -> str:
-        completed = subprocess.run(
-            (resolve_lark_cli_executable(), *command[1:]),
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-        )
+        try:
+            completed = subprocess.run(
+                (resolve_lark_cli_executable(), *command[1:]),
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=False,
+                timeout=LARK_CLI_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise FeishuClientError("Feishu read command timed out.") from error
+        except (OSError, ValueError) as error:
+            raise FeishuClientError("Feishu read command could not start.") from error
+        if completed.returncode != 0:
+            raise FeishuClientError("Feishu read command execution failed.")
         output = completed.stdout if completed.stdout.strip() else completed.stderr
         if not output.strip():
             raise FeishuClientError("Feishu read command returned no response.")
@@ -289,7 +299,12 @@ def _append_optional(command: list[str], flag: str, value: str | None) -> None:
 
 
 def _identifier(value: str) -> str:
-    if not isinstance(value, str) or not value or value.startswith("-"):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("-")
+        or any(unicodedata.category(character) == "Cc" for character in value)
+    ):
         raise FeishuClientError("Feishu read command received an invalid identifier.")
     return value
 
