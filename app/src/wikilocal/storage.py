@@ -148,6 +148,46 @@ class Storage:
         )
         connection.commit()
 
+    def finalize_document_scan(self, seen_source_keys: set[str], cursor: Any) -> None:
+        """Atomically retire absent documents and advance the completed-scan cursor."""
+        connection = self._connection_or_raise()
+        try:
+            connection.execute("BEGIN")
+            if seen_source_keys:
+                placeholders = ", ".join("?" for _ in seen_source_keys)
+                connection.execute(
+                    f"""
+                    UPDATE sources
+                    SET active = 0, synced_at = ?
+                    WHERE source_type = 'document' AND active = 1
+                    AND source_key NOT IN ({placeholders})
+                    """,
+                    (_timestamp(), *sorted(seen_source_keys)),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE sources
+                    SET active = 0, synced_at = ?
+                    WHERE source_type = 'document' AND active = 1
+                    """,
+                    (_timestamp(),),
+                )
+            connection.execute(
+                """
+                INSERT INTO checkpoints (checkpoint_key, cursor_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(checkpoint_key) DO UPDATE SET
+                    cursor_json = excluded.cursor_json,
+                    updated_at = excluded.updated_at
+                """,
+                ("documents", _json_dumps(cursor), _timestamp()),
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        connection.commit()
+
     def _connection_or_raise(self) -> sqlite3.Connection:
         if self._connection is None:
             raise RuntimeError("Storage.initialize() must be called before use.")
