@@ -21,18 +21,18 @@ E   ModuleNotFoundError: No module named 'wikilocal.storage'
 E   ModuleNotFoundError: No module named 'wikilocal.feishu'
 ```
 
-## Review Remediation GREEN Evidence
+## Latest Review Remediation GREEN Evidence
 
-After adding the command-boundary, permission-preflight, FTS schema, and
-deterministic metadata tests, the following command was run from
-`D:\\wikilocal\\app`:
+After adding exact per-command read schemas and regression tests that reject
+`--download-resources` and unknown flags for every supported command, the
+following full suite command was run from `D:\\wikilocal\\app`:
 
 ```powershell
-.\\.venv\\Scripts\\python.exe -m pytest tests\\test_storage.py tests\\test_feishu.py -v
+.\\.venv\\Scripts\\python.exe -m pytest -v
 ```
 
 Captured result:
 
 ```text
-============================= 11 passed in 0.08s ==============================
+=================== 29 passed, 29 subtests passed ====================
 ```

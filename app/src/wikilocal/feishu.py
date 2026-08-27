@@ -24,16 +24,6 @@ class PermissionPreflight:
 
 
 class FeishuClient:
-    _READ_ONLY_COMMANDS = frozenset(
-        {
-            ("lark-cli", "im", "+chat-list"),
-            ("lark-cli", "im", "+chat-messages-list"),
-            ("lark-cli", "im", "+threads-messages-list"),
-            ("lark-cli", "wiki", "+space-list"),
-            ("lark-cli", "wiki", "+node-list"),
-            ("lark-cli", "docs", "+fetch"),
-        }
-    )
     _REQUIRED_SCOPES = (
         "im:chat:read",
         "im:message:readonly",
@@ -178,17 +168,103 @@ class FeishuClient:
 
     @classmethod
     def __validate_read_command(cls, command: tuple[str, ...]) -> None:
-        if len(command) < 3 or command[:3] not in cls._READ_ONLY_COMMANDS:
+        prefix = command[:3]
+        arguments = command[3:]
+        if prefix == ("lark-cli", "im", "+chat-list"):
+            cls.__validate_chat_list_arguments(arguments)
+        elif prefix == ("lark-cli", "im", "+chat-messages-list"):
+            cls.__validate_message_list_arguments(arguments, "--chat-id")
+        elif prefix == ("lark-cli", "im", "+threads-messages-list"):
+            cls.__validate_message_list_arguments(arguments, "--thread")
+        elif prefix == ("lark-cli", "wiki", "+space-list"):
+            cls.__validate_space_list_arguments(arguments)
+        elif prefix == ("lark-cli", "wiki", "+node-list"):
+            cls.__validate_node_list_arguments(arguments)
+        elif prefix == ("lark-cli", "docs", "+fetch"):
+            cls.__validate_document_fetch_arguments(arguments)
+        else:
             raise FeishuClientError("Feishu command is not allowed.")
-        if command.count("--as") != 1:
-            raise FeishuClientError("Feishu read commands must use user identity exactly once.")
-        as_index = command.index("--as")
-        if as_index + 1 >= len(command) or command[as_index + 1] != "user":
-            raise FeishuClientError("Feishu read commands must use user identity exactly once.")
-        if command.count("--format") != 1:
-            raise FeishuClientError("Feishu read commands must request JSON output.")
-        if command[-2:] != ("--format", "json"):
-            raise FeishuClientError("Feishu read commands must request JSON output.")
+
+    @staticmethod
+    def __validate_chat_list_arguments(arguments: tuple[str, ...]) -> None:
+        expected = ("--types", "p2p", "--types", "group", "--as", "user")
+        FeishuClient.__validate_optional_tail(arguments, expected, ("--page-token",))
+
+    @staticmethod
+    def __validate_message_list_arguments(
+        arguments: tuple[str, ...], identifier_flag: str
+    ) -> None:
+        if len(arguments) < 6 or arguments[0] != identifier_flag:
+            raise FeishuClientError("Feishu command is not allowed.")
+        _identifier(arguments[1])
+        expected = (identifier_flag, arguments[1], "--as", "user", "--order", "asc")
+        optional_flags = (
+            ("--page-token", "--start", "--end")
+            if identifier_flag == "--chat-id"
+            else ("--page-token",)
+        )
+        FeishuClient.__validate_optional_tail(arguments, expected, optional_flags)
+
+    @staticmethod
+    def __validate_space_list_arguments(arguments: tuple[str, ...]) -> None:
+        FeishuClient.__validate_optional_tail(arguments, ("--as", "user"), ("--page-token",))
+
+    @staticmethod
+    def __validate_node_list_arguments(arguments: tuple[str, ...]) -> None:
+        if len(arguments) < 4 or arguments[0] != "--space-id":
+            raise FeishuClientError("Feishu command is not allowed.")
+        _identifier(arguments[1])
+        offset = 2
+        if arguments[offset:offset + 1] == ("--parent-node-token",):
+            if len(arguments) <= offset + 1:
+                raise FeishuClientError("Feishu command is not allowed.")
+            _identifier(arguments[offset + 1])
+            offset += 2
+        expected = (*arguments[:offset], "--as", "user")
+        FeishuClient.__validate_optional_tail(arguments, expected, ("--page-token",))
+
+    @staticmethod
+    def __validate_document_fetch_arguments(arguments: tuple[str, ...]) -> None:
+        if len(arguments) != 8 or arguments[0] != "--doc":
+            raise FeishuClientError("Feishu command is not allowed.")
+        _identifier(arguments[1])
+        if arguments != (
+            "--doc",
+            arguments[1],
+            "--doc-format",
+            "markdown",
+            "--as",
+            "user",
+            "--format",
+            "json",
+        ):
+            raise FeishuClientError("Feishu command is not allowed.")
+
+    @staticmethod
+    def __validate_optional_tail(
+        arguments: tuple[str, ...],
+        required: tuple[str, ...],
+        optional_flags: tuple[str, ...],
+    ) -> None:
+        if not arguments[:len(required)] == required:
+            raise FeishuClientError("Feishu command is not allowed.")
+        remainder = arguments[len(required):]
+        if len(remainder) < 2 or remainder[-2:] != ("--format", "json"):
+            raise FeishuClientError("Feishu command is not allowed.")
+        optional_values = remainder[:-2]
+        if len(optional_values) % 2:
+            raise FeishuClientError("Feishu command is not allowed.")
+        seen_flags: set[str] = set()
+        last_flag_index = -1
+        for flag, value in zip(optional_values[::2], optional_values[1::2], strict=True):
+            if flag not in optional_flags or flag in seen_flags:
+                raise FeishuClientError("Feishu command is not allowed.")
+            flag_index = optional_flags.index(flag)
+            if flag_index <= last_flag_index:
+                raise FeishuClientError("Feishu command is not allowed.")
+            _identifier(value)
+            seen_flags.add(flag)
+            last_flag_index = flag_index
 
     @staticmethod
     def __run_lark_cli(command: tuple[str, ...]) -> str:

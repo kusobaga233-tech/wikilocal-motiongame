@@ -99,6 +99,68 @@ class FeishuClientTests(unittest.TestCase):
 
         self.assertEqual(len(commands), 1)
 
+    def test_private_read_dispatcher_rejects_attachment_download_for_every_command(self) -> None:
+        client = FeishuClient(
+            runner=lambda command: json.dumps({"ok": True, "data": {"items": []}})
+        )
+        read = client._FeishuClient__read
+        commands = (
+            ("lark-cli", "im", "+chat-list", "--as", "user", "--download-resources", "--format", "json"),
+            ("lark-cli", "im", "+chat-messages-list", "--chat-id", "oc_1", "--as", "user", "--download-resources", "--format", "json"),
+            ("lark-cli", "im", "+threads-messages-list", "--thread", "omt_1", "--as", "user", "--download-resources", "--format", "json"),
+            ("lark-cli", "wiki", "+space-list", "--as", "user", "--download-resources", "--format", "json"),
+            ("lark-cli", "wiki", "+node-list", "--space-id", "space_1", "--as", "user", "--download-resources", "--format", "json"),
+            ("lark-cli", "docs", "+fetch", "--doc", "doc_1", "--doc-format", "markdown", "--as", "user", "--download-resources", "--format", "json"),
+        )
+
+        for command in commands:
+            with self.subTest(command=command[:3]):
+                with self.assertRaisesRegex(FeishuClientError, "not allowed"):
+                    read(command)
+
+    def test_private_read_dispatcher_rejects_unknown_flags_for_every_command(self) -> None:
+        client = FeishuClient(
+            runner=lambda command: json.dumps({"ok": True, "data": {"items": []}})
+        )
+        read = client._FeishuClient__read
+        commands = (
+            ("lark-cli", "im", "+chat-list", "--as", "user", "--unexpected", "value", "--format", "json"),
+            ("lark-cli", "im", "+chat-messages-list", "--chat-id", "oc_1", "--as", "user", "--unexpected", "value", "--format", "json"),
+            ("lark-cli", "im", "+threads-messages-list", "--thread", "omt_1", "--as", "user", "--unexpected", "value", "--format", "json"),
+            ("lark-cli", "wiki", "+space-list", "--as", "user", "--unexpected", "value", "--format", "json"),
+            ("lark-cli", "wiki", "+node-list", "--space-id", "space_1", "--as", "user", "--unexpected", "value", "--format", "json"),
+            ("lark-cli", "docs", "+fetch", "--doc", "doc_1", "--doc-format", "markdown", "--as", "user", "--unexpected", "value", "--format", "json"),
+        )
+
+        for command in commands:
+            with self.subTest(command=command[:3]):
+                with self.assertRaisesRegex(FeishuClientError, "not allowed"):
+                    read(command)
+
+    def test_private_read_dispatcher_allows_only_markdown_document_fetch(self) -> None:
+        command = (
+            "lark-cli",
+            "docs",
+            "+fetch",
+            "--doc",
+            "doc_1",
+            "--doc-format",
+            "markdown",
+            "--as",
+            "user",
+            "--format",
+            "json",
+        )
+        client = FeishuClient(
+            runner=lambda received: json.dumps(
+                {"ok": True, "data": {"command": list(received)}}
+            )
+        )
+
+        result = client._FeishuClient__read(command)
+
+        self.assertEqual(result, {"command": list(command)})
+
     def test_wiki_and_document_methods_construct_read_only_commands(self) -> None:
         commands: list[tuple[str, ...]] = []
 
