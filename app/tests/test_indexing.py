@@ -18,6 +18,11 @@ class FakeOllama:
         return [[float(len(text))] for text in texts]
 
 
+class FailingOllama:
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding model unavailable")
+
+
 class FakeVectors:
     def __init__(self) -> None:
         self.deleted: list[str] = []
@@ -125,3 +130,18 @@ class IndexingTests(unittest.TestCase):
         self.assertEqual(vectors.search([1.0], 10), [
             {"chunk_id": "document:d2:0:b", "source_key": "document:d2", "title": "D2", "text_content": "two", "vector": [2.0]}
         ])
+
+    def test_embed_failure_preserves_existing_fts_and_vector_chunks(self) -> None:
+        storage = self.make_storage()
+        storage.upsert_source(SourceRecord("document:d1", "document", "Release", "old keyword", {}, True))
+        vectors = FakeVectors()
+        Indexer(storage, FakeOllama(), vectors).index_source("document:d1")
+        original_fts = storage.search_fts("old", limit=10)
+        original_vectors = list(vectors.rows)
+        storage.upsert_source(SourceRecord("document:d1", "document", "Release", "new keyword", {}, True))
+
+        with self.assertRaisesRegex(RuntimeError, "embedding model unavailable"):
+            Indexer(storage, FailingOllama(), vectors).index_source("document:d1")
+
+        self.assertEqual(storage.search_fts("old", limit=10), original_fts)
+        self.assertEqual(vectors.rows, original_vectors)

@@ -135,3 +135,18 @@ class StorageTests(unittest.TestCase):
 
         self.assertEqual(first_json, '{"a":0,"nested":{"a":1,"b":2},"z":3}')
         self.assertEqual(second_json, first_json)
+
+    def test_search_fts_excludes_chunks_owned_by_inactive_sources(self) -> None:
+        storage = self.make_storage()
+        storage.upsert_source(SourceRecord("document:active", "document", "Active", "body", {}, True))
+        storage.upsert_source(SourceRecord("document:inactive", "document", "Inactive", "body", {}, False))
+        storage.replace_fts_chunks(
+            "document:active", [("document:active:0:x", "keyword active", "Active")]
+        )
+        storage.replace_fts_chunks(
+            "document:inactive", [("document:inactive:0:x", "keyword inactive", "Inactive")]
+        )
+
+        results = storage.search_fts("keyword", limit=20)
+
+        self.assertEqual([chunk.source_key for chunk in results], ["document:active"])

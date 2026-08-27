@@ -91,10 +91,8 @@ class Indexer:
             raise KeyError(f"Unknown source: {source_key}")
         chunks = chunk_text(source.text_content)
         fts_rows = [(_chunk_id(source_key, ordinal, text), text, source.title) for ordinal, text in enumerate(chunks)]
-        self._storage.replace_fts_chunks(source_key, fts_rows)
 
         if self._vector_store is not None:
-            self._vector_store.delete_source(source_key)
             embeddings = self._ollama.embed(chunks)
             rows = [
                 {
@@ -106,8 +104,12 @@ class Indexer:
                 }
                 for (chunk_id, text, _title), embedding in zip(fts_rows, embeddings, strict=True)
             ]
+            self._storage.replace_fts_chunks(source_key, fts_rows)
+            self._vector_store.delete_source(source_key)
             if rows:
                 self._vector_store.add(rows)
+        else:
+            self._storage.replace_fts_chunks(source_key, fts_rows)
         return len(chunks)
 
 

@@ -37,6 +37,9 @@ class SearchableVectorStore(Protocol):
 
 
 class Retriever:
+    _MAX_CANDIDATES = 20
+    _FTS_QUOTA_WITH_VECTORS = 12
+
     def __init__(
         self, storage: Storage, ollama: RetrievalModel, vector_store: SearchableVectorStore | None = None
     ) -> None:
@@ -47,11 +50,19 @@ class Retriever:
     def search(self, question: str, limit: int = 8) -> list[Evidence]:
         if not question.strip() or limit <= 0:
             return []
-        candidates = self._from_fts(question)
+        fts_candidates = self._from_fts(question)
+        vector_candidates: list[Evidence] = []
         if self._vector_store is not None:
             embedding = self._ollama.embed([question])[0]
-            candidates.extend(self._from_vectors(self._vector_store.search(embedding, 20)))
-        unique = _deduplicate(candidates)[:20]
+            vector_candidates = self._from_vectors(
+                self._vector_store.search(embedding, self._MAX_CANDIDATES)
+            )
+        unique = _select_candidates(
+            fts_candidates,
+            vector_candidates,
+            self._MAX_CANDIDATES,
+            self._FTS_QUOTA_WITH_VECTORS,
+        )
         if not unique:
             return []
         scores = self._ollama.rerank(question, [evidence.text_content for evidence in unique])
@@ -66,16 +77,18 @@ class Retriever:
             rows = self._storage.search_fts(question, limit=20)
         except Exception:
             return []
-        return [self._from_chunk(row) for row in rows]
+        return [evidence for row in rows if (evidence := self._from_chunk(row)) is not None]
 
-    def _from_chunk(self, chunk: ChunkRecord) -> Evidence:
+    def _from_chunk(self, chunk: ChunkRecord) -> Evidence | None:
         source = self._storage.get_source(chunk.source_key)
+        if source is None or not source.active:
+            return None
         return Evidence(
             chunk_id=chunk.chunk_id,
             source_key=chunk.source_key,
             title=chunk.title,
             text_content=chunk.text_content,
-            metadata={} if source is None else source.metadata,
+            metadata=source.metadata,
         )
 
     def _from_vectors(self, rows: Sequence[Mapping[str, object]]) -> list[Evidence]:
@@ -85,13 +98,15 @@ class Retriever:
             if not all(isinstance(row.get(key), str) for key in required):
                 continue
             source = self._storage.get_source(str(row["source_key"]))
+            if source is None or not source.active:
+                continue
             evidence.append(
                 Evidence(
                     chunk_id=str(row["chunk_id"]),
                     source_key=str(row["source_key"]),
                     title=str(row["title"]),
                     text_content=str(row["text_content"]),
-                    metadata={} if source is None else source.metadata,
+                    metadata=source.metadata,
                 )
             )
         return evidence
@@ -116,6 +131,34 @@ def _deduplicate(candidates: Sequence[Evidence]) -> list[Evidence]:
     for candidate in candidates:
         unique.setdefault(candidate.chunk_id, candidate)
     return list(unique.values())
+
+
+def _select_candidates(
+    fts_candidates: Sequence[Evidence],
+    vector_candidates: Sequence[Evidence],
+    limit: int,
+    fts_quota_with_vectors: int,
+) -> list[Evidence]:
+    """Keep deterministic FTS and vector quotas before the shared reranking cap."""
+    fts_unique = _deduplicate(fts_candidates)
+    if not vector_candidates:
+        return fts_unique[:limit]
+
+    selected = fts_unique[:fts_quota_with_vectors]
+    seen = {candidate.chunk_id for candidate in selected}
+    for candidate in _deduplicate(vector_candidates):
+        if candidate.chunk_id not in seen:
+            selected.append(candidate)
+            seen.add(candidate.chunk_id)
+        if len(selected) == limit:
+            return selected
+    for candidate in fts_unique[fts_quota_with_vectors:]:
+        if candidate.chunk_id not in seen:
+            selected.append(candidate)
+            seen.add(candidate.chunk_id)
+        if len(selected) == limit:
+            break
+    return selected
 
 
 def _answer_prompt(question: str, evidence: Sequence[Evidence]) -> str:

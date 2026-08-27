@@ -179,9 +179,10 @@ class Storage:
             return []
         rows = self._connection_or_raise().execute(
             """
-            SELECT chunk_id, text_content, title, source_key
+            SELECT chunks_fts.chunk_id, chunks_fts.text_content, chunks_fts.title, chunks_fts.source_key
             FROM chunks_fts
-            WHERE chunks_fts MATCH ?
+            JOIN sources ON sources.source_key = chunks_fts.source_key
+            WHERE chunks_fts MATCH ? AND sources.active = 1
             ORDER BY bm25(chunks_fts), chunk_id
             LIMIT ?
             """,

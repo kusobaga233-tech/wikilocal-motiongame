@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
 class ModelUnavailableError(RuntimeError):
     """Raised when a required local Ollama endpoint or model is unavailable."""
+
+
+class InvalidOllamaBaseUrlError(ValueError):
+    """Raised when an Ollama endpoint is not a local loopback HTTP address."""
 
 
 HttpTransport = Callable[[str, str, dict[str, object]], Mapping[str, object]]
@@ -21,7 +26,7 @@ class OllamaClient:
         base_url: str = "http://127.0.0.1:11434",
         transport: HttpTransport | None = None,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
+        self._base_url = _validate_loopback_base_url(base_url)
         self._transport = transport or self._http_request
 
     def embed(self, texts: Sequence[str], *, model: str = "bge-m3") -> list[list[float]]:
@@ -84,8 +89,29 @@ class OllamaClient:
             method=method,
             headers={"Content-Type": "application/json"},
         )
-        with urlopen(request, timeout=60) as response:  # nosec B310: loopback URL is configurable by user.
+        with urlopen(request, timeout=60) as response:  # nosec B310: validated loopback URL.
             decoded: Any = json.loads(response.read().decode("utf-8"))
         if not isinstance(decoded, Mapping):
             raise ValueError("Ollama did not return a JSON object.")
         return decoded
+
+
+def _validate_loopback_base_url(base_url: str) -> str:
+    try:
+        parsed = urlsplit(base_url)
+        _ = parsed.port
+    except ValueError as error:
+        raise InvalidOllamaBaseUrlError("Ollama base URL must be a valid local HTTP URL.") from error
+
+    if (
+        parsed.scheme.lower() != "http"
+        or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise InvalidOllamaBaseUrlError(
+            "Ollama base URL must use http://localhost, http://127.0.0.1, or http://[::1]."
+        )
+    return base_url.rstrip("/")

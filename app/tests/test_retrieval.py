@@ -49,6 +49,14 @@ class FakeVectors:
         ][:limit]
 
 
+class ManyVectors:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    def search(self, embedding: list[float], limit: int) -> list[dict[str, object]]:
+        return self.rows[:limit]
+
+
 class FakeEmbeddingOllama(FakeOllama):
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [[1.0] for _ in texts]
@@ -81,6 +89,59 @@ class RetrievalTests(unittest.TestCase):
         self.assertLessEqual(len(ollama.rerank_inputs[0]), 20)
         self.assertEqual(results[0].source_key, "document:d0")
 
+    def test_search_reserves_vector_candidates_when_fts_returns_twenty_hits(self) -> None:
+        storage = self.make_storage()
+        for index in range(20):
+            source_key = f"document:fts{index:02d}"
+            storage.upsert_source(SourceRecord(source_key, "document", f"Doc {index}", "body", {}, True))
+            storage.replace_fts_chunks(
+                source_key,
+                [(f"{source_key}:0:x", f"keyword fts {index}", f"Doc {index}")],
+            )
+        for index in range(8):
+            source_key = f"document:vector{index:02d}"
+            storage.upsert_source(SourceRecord(source_key, "document", f"Vector {index}", "body", {}, True))
+        vector_rows = [
+            {
+                "chunk_id": f"document:vector{index:02d}:0:x",
+                "source_key": f"document:vector{index:02d}",
+                "title": f"Vector {index}",
+                "text_content": f"vector candidate {index}",
+            }
+            for index in range(8)
+        ]
+        ollama = FakeEmbeddingOllama()
+
+        Retriever(storage, ollama, ManyVectors(vector_rows)).search("keyword", limit=8)
+
+        self.assertEqual(len(ollama.rerank_inputs[0]), 20)
+        self.assertTrue(
+            {f"vector candidate {index}" for index in range(8)}.issubset(ollama.rerank_inputs[0])
+        )
+
+    def test_search_excludes_inactive_sources_from_vector_evidence(self) -> None:
+        storage = self.make_storage()
+        storage.upsert_source(SourceRecord("document:active", "document", "Active", "body", {}, True))
+        storage.upsert_source(SourceRecord("document:inactive", "document", "Inactive", "body", {}, False))
+        vectors = ManyVectors([
+            {
+                "chunk_id": "document:inactive:0:x",
+                "source_key": "document:inactive",
+                "title": "Inactive",
+                "text_content": "keyword inactive",
+            },
+            {
+                "chunk_id": "document:active:0:x",
+                "source_key": "document:active",
+                "title": "Active",
+                "text_content": "keyword active",
+            },
+        ])
+
+        results = Retriever(storage, FakeEmbeddingOllama(), vectors).search("keyword")
+
+        self.assertEqual([item.source_key for item in results], ["document:active"])
+
     def test_answer_keeps_citations_independent_from_model_text_and_uses_only_evidence(self) -> None:
         ollama = FakeOllama()
         evidence = Evidence(
@@ -109,4 +170,3 @@ class RetrievalTests(unittest.TestCase):
 
         with self.assertRaises(ModelUnavailableError):
             OllamaClient(transport=unavailable).embed(["hello"])
-
