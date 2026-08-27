@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WikiLocal</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>WikiLocal</h1>
+          <p id="model-status" class="status-line">正在检查本地服务</p>
+        </div>
+        <div class="sync-actions" aria-label="同步控制">
+          <button type="button" class="icon-button" data-sync="documents" title="同步文档" aria-label="同步文档">D</button>
+          <button type="button" class="icon-button" data-sync="chats" title="同步聊天" aria-label="同步聊天">C</button>
+          <button type="button" class="icon-button primary" data-sync="all" title="全部同步" aria-label="全部同步">S</button>
+        </div>
+      </header>
+
+      <section class="workspace" aria-label="本地知识库问答">
+        <section class="answer-pane">
+          <div id="conversation" class="conversation" aria-live="polite">
+            <div class="empty-state">从本地飞书文档和聊天记录中提问</div>
+          </div>
+          <form id="question-form" class="question-form">
+            <label class="sr-only" for="question">问题</label>
+            <textarea id="question" name="question" rows="3" maxlength="4000" placeholder="输入问题"></textarea>
+            <button id="ask-button" type="submit">提问</button>
+          </form>
+        </section>
+
+        <aside class="side-pane">
+          <div class="panel-tabs" role="tablist" aria-label="工作区">
+            <button type="button" class="tab is-active" data-panel="sources" role="tab">来源</button>
+            <button type="button" class="tab" data-panel="sync" role="tab">同步</button>
+            <button type="button" class="tab" data-panel="settings" role="tab">设置</button>
+          </div>
+
+          <section class="panel is-active" data-panel-content="sources">
+            <input id="source-search" type="search" placeholder="搜索已同步内容">
+            <div id="source-list" class="source-list"></div>
+          </section>
+
+          <section class="panel" data-panel-content="sync">
+            <div id="sync-status" class="sync-status"></div>
+          </section>
+
+          <section class="panel" data-panel-content="settings">
+            <form id="settings-form" class="settings-form">
+              <label>每日同步时间<input id="daily-time" type="time" required></label>
+              <label class="switch-row"><input id="documents-enabled" type="checkbox">文档同步</label>
+              <label class="switch-row"><input id="chats-enabled" type="checkbox">聊天同步</label>
+              <label>聊天历史起始日<input id="history-start" type="date"></label>
+              <button type="submit">保存设置</button>
+            </form>
+          </section>
+        </aside>
+      </section>
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </main>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

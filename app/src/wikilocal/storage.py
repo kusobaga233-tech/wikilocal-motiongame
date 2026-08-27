@@ -38,7 +38,9 @@ class Storage:
     def initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         if self._connection is None:
-            self._connection = sqlite3.connect(self.database_path)
+            # FastAPI executes synchronous endpoints in a worker thread while the
+            # application can be initialized and shut down on another thread.
+            self._connection = sqlite3.connect(self.database_path, check_same_thread=False)
             self._connection.row_factory = sqlite3.Row
 
         self._connection.executescript(
