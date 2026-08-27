@@ -4,13 +4,32 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from wikilocal import feishu
 from wikilocal.feishu import FeishuClient, FeishuClientError
 
 
 class FeishuClientTests(unittest.TestCase):
+    def test_windows_executable_resolution_prefers_available_cmd_file(self) -> None:
+        cmd_path = r"C:\\Users\\Admin\\AppData\\Roaming\\npm\\lark-cli.cmd"
+
+        def which(candidate: str) -> str | None:
+            return cmd_path if candidate == "lark-cli.cmd" else None
+
+        with patch("shutil.which", side_effect=which):
+            executable = feishu.resolve_lark_cli_executable(platform_name="nt")
+
+        self.assertEqual(executable, cmd_path)
+
+    def test_executable_resolution_keeps_cross_platform_fallback(self) -> None:
+        with patch("shutil.which", return_value=None):
+            executable = feishu.resolve_lark_cli_executable(platform_name="posix")
+
+        self.assertEqual(executable, "lark-cli")
+
     def test_list_chats_constructs_a_read_only_user_command(self) -> None:
         commands: list[tuple[str, ...]] = []
 
@@ -188,3 +207,41 @@ class FeishuClientTests(unittest.TestCase):
             result.remediation_commands,
         )
         self.assertEqual(commands, [("lark-cli", "auth", "status", "--json", "--verify")])
+
+    def test_permission_preflight_accepts_whitespace_separated_user_scopes(self) -> None:
+        client = FeishuClient(
+            runner=lambda command: json.dumps(
+                {
+                    "ok": True,
+                    "identities": {
+                        "user": {
+                            "scope": "im:chat:read im:message:readonly "
+                            "docx:document:readonly wiki:space:retrieve"
+                        }
+                    },
+                }
+            )
+        )
+
+        result = client.permission_preflight()
+
+        self.assertEqual(result.missing_scopes, ())
+        self.assertIn("wiki:space:retrieve", result.granted_scopes)
+
+    def test_permission_preflight_accepts_auth_status_payload_without_ok(self) -> None:
+        client = FeishuClient(
+            runner=lambda command: json.dumps(
+                {
+                    "identities": {
+                        "user": {
+                            "scope": "im:chat:read im:message:readonly "
+                            "docx:document:readonly wiki:space:retrieve"
+                        }
+                    }
+                }
+            )
+        )
+
+        result = client.permission_preflight()
+
+        self.assertEqual(result.missing_scopes, ())

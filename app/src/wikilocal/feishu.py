@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -132,7 +134,7 @@ class FeishuClient:
         )
 
     def permission_preflight(self) -> PermissionPreflight:
-        payload = self.__invoke(("lark-cli", "auth", "status", "--json", "--verify"))
+        payload = self.__auth_status()
         granted_scopes = _user_scopes(payload)
         missing_scopes = tuple(
             scope for scope in self._REQUIRED_SCOPES if scope not in granted_scopes
@@ -163,6 +165,17 @@ class FeishuClient:
             raise FeishuClientError("Feishu read command failed.")
         return payload
 
+    def __auth_status(self) -> Mapping[str, Any]:
+        try:
+            payload = json.loads(
+                self.__runner(("lark-cli", "auth", "status", "--json", "--verify"))
+            )
+        except (OSError, json.JSONDecodeError, TypeError) as error:
+            raise FeishuClientError("Feishu auth status did not return valid JSON.") from error
+        if not isinstance(payload, dict):
+            raise FeishuClientError("Feishu auth status did not return an object.")
+        return payload
+
     @classmethod
     def __validate_read_command(cls, command: tuple[str, ...]) -> None:
         if len(command) < 3 or command[:3] not in cls._READ_ONLY_COMMANDS:
@@ -180,7 +193,7 @@ class FeishuClient:
     @staticmethod
     def __run_lark_cli(command: tuple[str, ...]) -> str:
         completed = subprocess.run(
-            command,
+            (resolve_lark_cli_executable(), *command[1:]),
             check=False,
             capture_output=True,
             text=True,
@@ -213,6 +226,24 @@ def _user_scopes(payload: Mapping[str, Any]) -> frozenset[str]:
     if not isinstance(user, dict):
         return frozenset()
     scopes = user.get("scope")
-    if not isinstance(scopes, list):
+    if isinstance(scopes, str):
+        values = scopes.split()
+    elif isinstance(scopes, list):
+        values = scopes
+    else:
         return frozenset()
-    return frozenset(scope for scope in scopes if isinstance(scope, str))
+    return frozenset(scope for scope in values if isinstance(scope, str) and scope)
+
+
+def resolve_lark_cli_executable(*, platform_name: str | None = None) -> str:
+    platform_name = platform_name or os.name
+    candidates = (
+        ("lark-cli.cmd", "lark-cli.exe", "lark-cli")
+        if platform_name == "nt"
+        else ("lark-cli",)
+    )
+    for candidate in candidates:
+        executable = shutil.which(candidate)
+        if executable:
+            return executable
+    return "lark-cli"
