@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +20,14 @@ class SourceRecord:
     text_content: str
     metadata: Mapping[str, Any]
     active: bool
+
+
+@dataclass(frozen=True)
+class ChunkRecord:
+    chunk_id: str
+    text_content: str
+    title: str
+    source_key: str
 
 
 class Storage:
@@ -123,6 +131,68 @@ class Storage:
                 text_content=row["text_content"],
                 metadata=json.loads(row["metadata_json"]),
                 active=bool(row["active"]),
+            )
+            for row in rows
+        ]
+
+    def get_source(self, source_key: str) -> SourceRecord | None:
+        row = self._connection_or_raise().execute(
+            """
+            SELECT source_key, source_type, title, text_content, metadata_json, active
+            FROM sources WHERE source_key = ?
+            """,
+            (source_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return SourceRecord(
+            source_key=row["source_key"],
+            source_type=row["source_type"],
+            title=row["title"],
+            text_content=row["text_content"],
+            metadata=json.loads(row["metadata_json"]),
+            active=bool(row["active"]),
+        )
+
+    def replace_fts_chunks(
+        self, source_key: str, chunks: Sequence[tuple[str, str, str]]
+    ) -> None:
+        """Replace every FTS chunk owned by a source in one transaction."""
+        connection = self._connection_or_raise()
+        try:
+            connection.execute("BEGIN")
+            connection.execute("DELETE FROM chunks_fts WHERE source_key = ?", (source_key,))
+            connection.executemany(
+                """
+                INSERT INTO chunks_fts (chunk_id, text_content, title, source_key)
+                VALUES (?, ?, ?, ?)
+                """,
+                [(chunk_id, text, title, source_key) for chunk_id, text, title in chunks],
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        connection.commit()
+
+    def search_fts(self, query: str, *, limit: int = 20) -> list[ChunkRecord]:
+        if not query.strip() or limit <= 0:
+            return []
+        rows = self._connection_or_raise().execute(
+            """
+            SELECT chunk_id, text_content, title, source_key
+            FROM chunks_fts
+            WHERE chunks_fts MATCH ?
+            ORDER BY bm25(chunks_fts), chunk_id
+            LIMIT ?
+            """,
+            (query, limit),
+        ).fetchall()
+        return [
+            ChunkRecord(
+                chunk_id=row["chunk_id"],
+                text_content=row["text_content"],
+                title=row["title"],
+                source_key=row["source_key"],
             )
             for row in rows
         ]
