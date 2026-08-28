@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 import subprocess
 import xml.etree.ElementTree as element_tree
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from wikilocal.settings import Settings
 
@@ -17,6 +19,7 @@ _SYNC_COMMAND_PATTERN = re.compile(
     r'^(?P<program>"[^"]+"|[^\s]+)\s+(?P<arguments>-m wikilocal\.cli sync --all)\Z'
 )
 _TASK_NAME = "WikiLocalDailySync"
+TaskRunner = Callable[..., subprocess.CompletedProcess[Any]]
 
 
 def build_task_xml(command: str, daily_time: str) -> str:
@@ -53,11 +56,16 @@ def write_task_xml(settings: Settings, command: str) -> Path:
     return task_file
 
 
-def install_daily_task(settings: Settings, command: str) -> Path:
+def install_daily_task(
+    settings: Settings,
+    command: str,
+    *,
+    runner: TaskRunner = subprocess.run,
+) -> Path:
     """Write and register exactly the WikiLocal daily sync task when the CLI asks for it."""
     task_file = write_task_xml(settings, command)
     try:
-        subprocess.run(
+        runner(
             ["schtasks", "/Create", "/TN", _TASK_NAME, "/XML", str(task_file), "/F"],
             check=True,
             timeout=60,
@@ -65,3 +73,25 @@ def install_daily_task(settings: Settings, command: str) -> Path:
     except (OSError, subprocess.SubprocessError) as error:
         raise SchedulerError("Unable to create the WikiLocal daily sync task.") from error
     return task_file
+
+
+def reconfigure_daily_task_if_installed(
+    settings: Settings,
+    command: str,
+    *,
+    runner: TaskRunner = subprocess.run,
+) -> bool:
+    """Update the installed task, without creating a new task from a settings save."""
+    try:
+        result = runner(
+            ["schtasks", "/Query", "/TN", _TASK_NAME],
+            check=False,
+            timeout=60,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SchedulerError("Unable to check the WikiLocal daily sync task.") from error
+    if result.returncode != 0:
+        return False
+    install_daily_task(settings, command, runner=runner)
+    return True

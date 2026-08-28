@@ -14,6 +14,7 @@ if (-not (Test-Path $python)) {
   py -3.12 -m venv (Join-Path $app ".venv")
 }
 
+Set-Location $app
 & $python -m pip install --upgrade pip
 & $python -m pip install -e ".[test,vector]"
 

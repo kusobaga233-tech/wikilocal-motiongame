@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from collections.abc import Callable, Mapping
 from pathlib import Path
+import sys
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
@@ -13,6 +15,7 @@ from wikilocal.feishu import FeishuClient
 from wikilocal.indexing import Indexer
 from wikilocal.ollama import ModelUnavailableError, OllamaClient
 from wikilocal.retrieval import AnswerService, Retriever
+from wikilocal.scheduler import reconfigure_daily_task_if_installed
 from wikilocal.settings import Settings, SettingsError
 from wikilocal.storage import SourceRecord, Storage
 from wikilocal.sync_chats import ChatSynchronizer
@@ -20,6 +23,9 @@ from wikilocal.sync_documents import DocumentSynchronizer, SyncResult
 
 
 SyncKind = Literal["documents", "chats", "all"]
+MODEL_NAMES = {"answer": "qwen3:4b", "embedding": "bge-m3", "reranker": "bge-reranker-v2-m3"}
+ModelStatusProvider = Callable[[], Mapping[str, bool]]
+ScheduleReconfigurer = Callable[[Settings], bool]
 
 
 class AnswerRequest(BaseModel):
@@ -54,15 +60,28 @@ class Runtime:
             "chats": _empty_sync_status(),
         }
 
-    def synchronize(self, kind: SyncKind) -> dict[str, int | str | None]:
+    def synchronize(
+        self, kind: SyncKind, *, honor_enabled: bool = False
+    ) -> dict[str, int | str | None]:
         selected = (
             (("documents", self.document_synchronizer), ("chats", self.chat_synchronizer))
             if kind == "all"
             else ((kind, self.document_synchronizer if kind == "documents" else self.chat_synchronizer),)
         )
+        if kind == "all" and honor_enabled:
+            selected = tuple(
+                (name, synchronizer)
+                for name, synchronizer in selected
+                if (name == "documents" and self.settings.documents_enabled)
+                or (name == "chats" and self.settings.chats_enabled)
+            )
         total = SyncResult()
         for name, synchronizer in selected:
-            result = synchronizer.sync()
+            try:
+                result = synchronizer.sync()
+            except Exception as error:
+                self.last_sync[name] = _failed_sync_status(error)
+                raise
             self.last_sync[name] = _sync_result_dict(result)
             total = total.add(
                 created=int(result.created),
@@ -100,6 +119,8 @@ def create_app(
     chat_synchronizer: Any | None = None,
     storage: Storage | None = None,
     indexer: Indexer | None = None,
+    schedule_reconfigurer: ScheduleReconfigurer | None = None,
+    model_status_provider: ModelStatusProvider | None = None,
 ) -> FastAPI:
     owns_storage = storage is None
     if storage is None:
@@ -123,6 +144,8 @@ def create_app(
         chat_synchronizer,
         indexer,
     )
+    schedule_reconfigurer = schedule_reconfigurer or _reconfigure_existing_schedule
+    model_status_provider = model_status_provider or _local_model_availability
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
@@ -134,10 +157,15 @@ def create_app(
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
+        availability = _complete_model_availability(model_status_provider())
         return {
             "status": "ok",
             "host": "127.0.0.1",
-            "models": {"answer": "qwen3:4b", "embedding": "bge-m3", "reranker": "bge-reranker-v2-m3"},
+            "models": {
+                role: {"name": model, "available": availability[model]}
+                for role, model in MODEL_NAMES.items()
+            },
+            "model_available": all(availability.values()),
         }
 
     @app.get("/api/settings")
@@ -157,6 +185,11 @@ def create_app(
             candidate.save()
         except SettingsError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+        if candidate.daily_time != runtime.settings.daily_time:
+            try:
+                schedule_reconfigurer(candidate)
+            except RuntimeError as error:
+                raise HTTPException(status_code=503, detail="Unable to update the existing daily task.") from error
         runtime.settings.daily_time = candidate.daily_time
         runtime.settings.documents_enabled = candidate.documents_enabled
         runtime.settings.chats_enabled = candidate.chats_enabled
@@ -168,7 +201,7 @@ def create_app(
         if kind not in {"documents", "chats", "all"}:
             raise HTTPException(status_code=404, detail="Unknown sync kind")
         try:
-            return runtime.synchronize(kind)  # type: ignore[arg-type]
+            return runtime.synchronize(kind, honor_enabled=kind == "all")  # type: ignore[arg-type]
         except (ModelUnavailableError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -231,6 +264,32 @@ def _sync_result_dict(result: SyncResult | Any) -> dict[str, int | str | None]:
 
 def _empty_sync_status() -> dict[str, int | str | None]:
     return {"created": 0, "changed": 0, "skipped": 0, "failed": 0, "error": None}
+
+
+def _failed_sync_status(error: Exception) -> dict[str, int | str | None]:
+    return {
+        "created": 0,
+        "changed": 0,
+        "skipped": 0,
+        "failed": 1,
+        "error": f"Synchronization failed ({type(error).__name__}).",
+    }
+
+
+def _reconfigure_existing_schedule(settings: Settings) -> bool:
+    command = f'"{sys.executable}" -m wikilocal.cli sync --all'
+    return reconfigure_daily_task_if_installed(settings, command)
+
+
+def _local_model_availability() -> Mapping[str, bool]:
+    try:
+        return OllamaClient().model_availability(tuple(MODEL_NAMES.values()))
+    except ModelUnavailableError:
+        return {model: False for model in MODEL_NAMES.values()}
+
+
+def _complete_model_availability(availability: Mapping[str, bool]) -> dict[str, bool]:
+    return {model: availability.get(model) is True for model in MODEL_NAMES.values()}
 
 
 def _evidence_dict(evidence: Any) -> dict[str, object]:

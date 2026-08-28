@@ -10,6 +10,22 @@ from wikilocal.ollama import OllamaClient
 
 
 class OllamaClientTests(unittest.TestCase):
+    def test_model_availability_uses_only_local_tags_response(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        def transport(method: str, path: str, payload: dict[str, object]) -> dict[str, object]:
+            calls.append((method, path, payload))
+            return {"models": [{"name": "qwen3:4b"}, {"name": "bge-m3:latest"}]}
+
+        client = OllamaClient(transport=transport)
+
+        assert client.model_availability(["qwen3:4b", "bge-m3", "bge-reranker-v2-m3"]) == {
+            "qwen3:4b": True,
+            "bge-m3": True,
+            "bge-reranker-v2-m3": False,
+        }
+        self.assertEqual(calls, [("GET", "/api/tags", {})])
+
     def test_accepts_only_http_loopback_base_urls(self) -> None:
         for base_url in (
             "http://localhost",

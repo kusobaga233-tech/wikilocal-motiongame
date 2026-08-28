@@ -49,7 +49,10 @@ const refreshSources = async (query = "") => {
 
 const refreshStatus = async () => {
   const result = await api("/sync/status");
-  const show = (label, item) => `<div class="status-row"><strong>${label}</strong><span>新增 ${item.created} · 更新 ${item.changed} · 跳过 ${item.skipped} · 失败 ${item.failed}</span></div>`;
+  const show = (label, item) => {
+    const error = item.error ? `<small class="sync-error">${escapeHtml(item.error)}</small>` : "";
+    return `<div class="status-row"><strong>${label}</strong><span>新增 ${item.created} · 更新 ${item.changed} · 跳过 ${item.skipped} · 失败 ${item.failed}</span>${error}</div>`;
+  };
   document.querySelector("#sync-status").innerHTML = show("文档", result.documents) + show("聊天", result.chats);
 };
 
@@ -136,5 +139,9 @@ document.querySelector("#source-search").addEventListener("input", (event) => {
 });
 
 Promise.all([api("/health"), refreshSources(), refreshStatus(), loadSettings()])
-  .then(([health]) => { document.querySelector("#model-status").textContent = `本地模型：${health.models.answer}`; })
+  .then(([health]) => {
+    document.querySelector("#model-status").textContent = health.model_available
+      ? `本地模型：${health.models.answer.name}`
+      : "本地模型不可用";
+  })
   .catch((error) => { document.querySelector("#model-status").textContent = "本地服务不可用"; toast(error.message, true); });

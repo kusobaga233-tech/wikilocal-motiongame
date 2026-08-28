@@ -73,6 +73,24 @@ class OllamaClient:
             raise ModelUnavailableError("Local Ollama generation response is invalid.")
         return response
 
+    def model_availability(self, models: Sequence[str]) -> dict[str, bool]:
+        """Check whether the requested models exist in the local Ollama registry."""
+        payload = self._call("GET", "/api/tags", {})
+        raw_models = payload.get("models")
+        if not isinstance(raw_models, list):
+            raise ModelUnavailableError("Local Ollama model list response is invalid.")
+        installed = {
+            name
+            for item in raw_models
+            if isinstance(item, Mapping)
+            for name in [_model_name(item.get("name"))]
+            if name
+        }
+        return {
+            model: model in installed or f"{model}:latest" in installed
+            for model in models
+        }
+
     def _call(self, method: str, path: str, payload: dict[str, object]) -> Mapping[str, object]:
         try:
             response = self._transport(method, path, payload)
@@ -85,7 +103,7 @@ class OllamaClient:
     def _http_request(self, method: str, path: str, payload: dict[str, object]) -> Mapping[str, object]:
         request = Request(
             f"{self._base_url}{path}",
-            data=json.dumps(payload).encode("utf-8"),
+            data=None if method == "GET" else json.dumps(payload).encode("utf-8"),
             method=method,
             headers={"Content-Type": "application/json"},
         )
@@ -115,3 +133,7 @@ def _validate_loopback_base_url(base_url: str) -> str:
             "Ollama base URL must use http://localhost, http://127.0.0.1, or http://[::1]."
         )
     return base_url.rstrip("/")
+
+
+def _model_name(value: object) -> str:
+    return value if isinstance(value, str) else ""

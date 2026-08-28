@@ -31,7 +31,7 @@ def main(
         kind = "documents" if args.documents else "chats" if args.chats else "all"
         runtime = runtime_factory(settings)
         try:
-            print(json.dumps(runtime.synchronize(kind), ensure_ascii=False))
+            print(json.dumps(runtime.synchronize(kind, honor_enabled=kind == "all"), ensure_ascii=False))
         finally:
             runtime.storage.close()
         return 0
@@ -59,10 +59,16 @@ def _parser() -> argparse.ArgumentParser:
     sync_kind.add_argument("--all", action="store_true")
 
     serve = commands.add_parser("serve", help="Run the local web application")
-    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--host", default="127.0.0.1", type=_loopback_host)
     serve.add_argument("--port", default=8765, type=int)
     commands.add_parser("schedule", help="Install the daily local sync task")
     return parser
+
+
+def _loopback_host(value: str) -> str:
+    if value not in {"127.0.0.1", "localhost"}:
+        raise argparse.ArgumentTypeError("WikiLocal may only bind to 127.0.0.1 or localhost.")
+    return value
 
 
 def _run_setup_script(root: Path) -> int:
