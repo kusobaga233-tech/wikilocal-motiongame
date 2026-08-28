@@ -74,8 +74,9 @@ class Runtime:
                 for name, synchronizer in selected
                 if (name == "documents" and self.settings.documents_enabled)
                 or (name == "chats" and self.settings.chats_enabled)
-            )
+        )
         total = SyncResult()
+        completed: list[tuple[str, Any]] = []
         for name, synchronizer in selected:
             try:
                 result = synchronizer.sync()
@@ -89,10 +90,16 @@ class Runtime:
                 skipped=int(result.skipped),
                 failed=int(result.failed),
             )
+            completed.append((name, result))
         if self.indexer is not None and total.failed == 0:
-            for source in self.storage.list_sources(active_only=True):
-                if source.text_content:
-                    self.indexer.index_source(source.source_key)
+            try:
+                for source in self.storage.list_sources(active_only=True):
+                    if source.text_content:
+                        self.indexer.index_source(source.source_key)
+            except Exception as error:
+                for name, result in completed:
+                    self.last_sync[name] = _failed_result_status(result, error)
+                raise
         return _sync_result_dict(total)
 
 
@@ -182,14 +189,18 @@ def create_app(
             chat_history_start=payload.chat_history_start,
         )
         try:
-            candidate.save()
+            candidate.validate()
         except SettingsError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         if candidate.daily_time != runtime.settings.daily_time:
             try:
                 schedule_reconfigurer(candidate)
-            except RuntimeError as error:
+            except (RuntimeError, ValueError) as error:
                 raise HTTPException(status_code=503, detail="Unable to update the existing daily task.") from error
+        try:
+            candidate.save()
+        except SettingsError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         runtime.settings.daily_time = candidate.daily_time
         runtime.settings.documents_enabled = candidate.documents_enabled
         runtime.settings.chats_enabled = candidate.chats_enabled
@@ -201,7 +212,7 @@ def create_app(
         if kind not in {"documents", "chats", "all"}:
             raise HTTPException(status_code=404, detail="Unknown sync kind")
         try:
-            return runtime.synchronize(kind, honor_enabled=kind == "all")  # type: ignore[arg-type]
+            return runtime.synchronize(kind, honor_enabled=False)  # type: ignore[arg-type]
         except (ModelUnavailableError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -272,8 +283,19 @@ def _failed_sync_status(error: Exception) -> dict[str, int | str | None]:
         "changed": 0,
         "skipped": 0,
         "failed": 1,
-        "error": f"Synchronization failed ({type(error).__name__}).",
+        "error": _sync_error_message(error),
     }
+
+
+def _failed_result_status(result: SyncResult | Any, error: Exception) -> dict[str, int | str | None]:
+    status = _sync_result_dict(result)
+    status["failed"] = max(1, int(result.failed))
+    status["error"] = _sync_error_message(error)
+    return status
+
+
+def _sync_error_message(error: Exception) -> str:
+    return f"Synchronization failed ({type(error).__name__})."
 
 
 def _reconfigure_existing_schedule(settings: Settings) -> bool:

@@ -58,3 +58,40 @@ GREEN verification after implementation:
 
 The follow-up tests use fake synchronizers, scheduler runners, and Ollama transports. No Feishu
 sync, Ollama installation/model download, or Task Scheduler task creation was executed.
+
+## Final P1 Fixes
+
+Additional tests were written first in `tests\\test_service.py` to require that manual
+`POST /api/sync/all` runs both sources regardless of their enabled settings, failed existing-task
+reconfiguration leaves `settings.json` at its previous `daily_time`, and a post-sync indexing
+failure is retained as a sanitized error in `/api/sync/status`. The existing
+`test_cli_scheduled_all_sync_honors_enabled_source_settings` test already covered the required
+scheduled `sync --all` behavior and remained green.
+
+RED verification from `D:\\wikilocal\\app`:
+
+```text
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_service.py tests\\test_scheduler.py -v
+3 failed, 24 passed
+```
+
+The failures showed that manual all-sync skipped disabled sources, task reconfiguration raised an
+uncontrolled 500 response after persisting the new time, and indexing failures left a successful
+sync status with no error.
+
+GREEN verification after the minimal service changes:
+
+```text
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_service.py tests\\test_scheduler.py -v
+27 passed
+```
+
+No real Feishu synchronization, Ollama model operation, or Windows Task Scheduler operation was
+performed for this regression fix.
+
+Full application verification from `D:\\wikilocal\\app`:
+
+```text
+.\\.venv\\Scripts\\python.exe -m pytest -v
+89 passed, 74 subtests passed
+```

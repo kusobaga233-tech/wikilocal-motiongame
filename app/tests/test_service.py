@@ -42,6 +42,11 @@ class FailingSynchronizer:
         raise RuntimeError("token=top-secret\nuntrusted detail")
 
 
+class FailingIndexer:
+    def index_source(self, source_key: str) -> int:
+        raise RuntimeError(f"embedding token=top-secret for {source_key}")
+
+
 @pytest.fixture()
 def client():
     from fastapi.testclient import TestClient
@@ -156,6 +161,93 @@ def test_scheduled_all_sync_honors_settings_but_manual_source_sync_is_forced(cli
     assert chats.calls == 1
     assert manual.status_code == 200
     assert documents.calls == 1
+
+
+def test_manual_all_sync_forces_both_sources_when_disabled(client) -> None:
+    test_client, _settings, documents, chats = client
+    test_client.put(
+        "/api/settings",
+        json={
+            "daily_time": "02:00",
+            "documents_enabled": False,
+            "chats_enabled": False,
+            "chat_history_start": None,
+        },
+    )
+
+    response = test_client.post("/api/sync/all")
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 2
+    assert documents.calls == 1
+    assert chats.calls == 1
+
+
+def test_failed_existing_task_reconfiguration_keeps_persisted_daily_time(client) -> None:
+    from fastapi.testclient import TestClient
+    from wikilocal.service import create_app
+
+    _test_client, settings, documents, chats = client
+    app = create_app(
+        settings,
+        answer_service=FakeAnswerService(),
+        document_synchronizer=documents,
+        chat_synchronizer=chats,
+        schedule_reconfigurer=lambda _candidate: (_ for _ in ()).throw(ValueError("task rejected")),
+        model_status_provider=lambda: {"qwen3:4b": False, "bge-m3": False, "bge-reranker-v2-m3": False},
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as configured_client:
+        response = configured_client.put(
+            "/api/settings",
+            json={
+                "daily_time": "04:15",
+                "documents_enabled": True,
+                "chats_enabled": True,
+                "chat_history_start": None,
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Unable to update the existing daily task."
+    assert Settings.load(settings.root).daily_time == "02:00"
+
+
+def test_indexing_failure_stores_sanitized_status_after_source_sync(client) -> None:
+    from fastapi.testclient import TestClient
+    from wikilocal.service import create_app
+    from wikilocal.storage import SourceRecord, Storage
+
+    _test_client, settings, documents, chats = client
+    storage = Storage(settings)
+    storage.initialize()
+    storage.upsert_source(
+        SourceRecord("document:index-me", "document", "Index me", "Text for indexing", {}, True)
+    )
+    app = create_app(
+        settings,
+        answer_service=FakeAnswerService(),
+        document_synchronizer=documents,
+        chat_synchronizer=chats,
+        storage=storage,
+        indexer=FailingIndexer(),
+        model_status_provider=lambda: {"qwen3:4b": False, "bge-m3": False, "bge-reranker-v2-m3": False},
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as failing_client:
+        response = failing_client.post("/api/sync/documents")
+        status = failing_client.get("/api/sync/status")
+
+    storage.close()
+    assert response.status_code == 503
+    assert status.json()["documents"] == {
+        "created": 1,
+        "changed": 2,
+        "skipped": 3,
+        "failed": 1,
+        "error": "Synchronization failed (RuntimeError).",
+    }
+    assert "top-secret" not in status.text
 
 
 def test_failed_sync_stores_a_sanitized_error_for_status_ui(client) -> None:
