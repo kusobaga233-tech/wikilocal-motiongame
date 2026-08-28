@@ -95,3 +95,38 @@ Full application verification from `D:\\wikilocal\\app`:
 .\\.venv\\Scripts\\python.exe -m pytest -v
 89 passed, 74 subtests passed
 ```
+
+## Start Script Readiness Fix
+
+A contract test was added first in `tests\\test_service.py`. It reads `scripts\\start.ps1`
+without executing it, so the test cannot leave a server process running. The contract requires a
+hidden background Uvicorn process to start before a bounded loop polls only
+`http://127.0.0.1:8765/api/health`, with the browser opened only after readiness succeeds and the
+new process stopped on timeout.
+
+RED verification from `D:\\wikilocal\\app`:
+
+```text
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_service.py::test_start_script_waits_for_local_health_before_opening_the_browser -v
+1 failed
+```
+
+The prior script opened the browser before starting the foreground Uvicorn command and did not
+poll the local health endpoint.
+
+GREEN verification after the script change:
+
+```text
+.\\.venv\\Scripts\\python.exe -m pytest tests\\test_service.py::test_start_script_waits_for_local_health_before_opening_the_browser -v
+1 passed
+```
+
+Final verification from `D:\\wikilocal\\app`:
+
+```text
+.\\.venv\\Scripts\\python.exe -m pytest -v
+90 passed, 74 subtests passed
+```
+
+`scripts\\start.ps1` was also parsed with PowerShell's parser without syntax errors. The start
+script was not executed during verification, so no server process was left running.

@@ -324,6 +324,21 @@ def test_setup_script_changes_to_the_absolute_app_directory_before_installing() 
     assert setup_script.index("Set-Location $app") < setup_script.index("-m pip install -e")
 
 
+def test_start_script_waits_for_local_health_before_opening_the_browser() -> None:
+    start_script = (Path(__file__).resolve().parents[1] / "scripts" / "start.ps1").read_text(encoding="utf-8")
+
+    server_start = start_script.index("Start-Process -FilePath $python")
+    health_poll = start_script.index('"http://127.0.0.1:8765/api/health"')
+    browser_open = start_script.index('Start-Process -FilePath "http://127.0.0.1:8765"')
+
+    assert "-WindowStyle Hidden" in start_script[server_start:health_poll]
+    assert "-PassThru" in start_script[server_start:health_poll]
+    assert "AddSeconds(20)" in start_script
+    assert server_start < health_poll < browser_open
+    assert "Stop-Process -Id $server.Id" in start_script
+    assert "exit 1" in start_script
+
+
 def test_sources_returns_searchable_active_local_sources(client) -> None:
     from wikilocal.storage import SourceRecord
 
