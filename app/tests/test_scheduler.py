@@ -20,6 +20,17 @@ def test_build_task_xml_uses_daily_time_and_local_cli_command() -> None:
     assert "<UserId>S-1-5-18</UserId>" not in xml
 
 
+def test_write_task_xml_uses_windows_task_scheduler_encoding(tmp_path: Path) -> None:
+    from wikilocal.scheduler import write_task_xml
+    from wikilocal.settings import Settings
+
+    task_file = write_task_xml(Settings.load(tmp_path), "python -m wikilocal.cli sync --all")
+
+    raw = task_file.read_bytes()
+    assert raw.startswith(b"\xff\xfe")
+    assert 'encoding="UTF-16"' in raw.decode("utf-16")
+
+
 @pytest.mark.parametrize("daily_time", ["2:00", "24:00", "12:60", "noon"])
 def test_build_task_xml_rejects_invalid_daily_time(daily_time: str) -> None:
     from wikilocal.scheduler import SchedulerError, build_task_xml

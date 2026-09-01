@@ -23,7 +23,7 @@ TaskRunner = Callable[..., subprocess.CompletedProcess[Any]]
 
 
 def build_task_xml(command: str, daily_time: str) -> str:
-    """Return a UTF-8 Task Scheduler definition for the sole WikiLocal sync task."""
+    """Return a Task Scheduler definition for the sole WikiLocal sync task."""
     if not _TIME_PATTERN.fullmatch(daily_time):
         raise SchedulerError("Invalid daily_time: expected HH:MM in 24-hour time.")
     match = _SYNC_COMMAND_PATTERN.fullmatch(command.strip())
@@ -44,7 +44,7 @@ def build_task_xml(command: str, daily_time: str) -> str:
     execute = element_tree.SubElement(actions, "Exec")
     element_tree.SubElement(execute, "Command").text = match.group("program").strip('"')
     element_tree.SubElement(execute, "Arguments").text = match.group("arguments")
-    return '<?xml version="1.0" encoding="UTF-8"?>\n' + element_tree.tostring(
+    return '<?xml version="1.0" encoding="UTF-16"?>\n' + element_tree.tostring(
         task, encoding="unicode", short_empty_elements=False
     )
 
@@ -52,7 +52,7 @@ def build_task_xml(command: str, daily_time: str) -> str:
 def write_task_xml(settings: Settings, command: str) -> Path:
     task_file = settings.root / "data" / "logs" / f"{_TASK_NAME}.xml"
     task_file.parent.mkdir(parents=True, exist_ok=True)
-    task_file.write_text(build_task_xml(command, settings.daily_time), encoding="utf-8", newline="\n")
+    task_file.write_text(build_task_xml(command, settings.daily_time), encoding="utf-16", newline="\n")
     return task_file
 
 
