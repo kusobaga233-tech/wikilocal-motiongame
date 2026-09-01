@@ -109,7 +109,7 @@ const createPendingAnswer = (question) => {
 
 const loadConversation = async () => {
   const result = await api("/conversations");
-  result.turns.forEach((turn) => appendAnswer(turn.question, turn));
+  result.turns.forEach((turn) => appendAnswer(turn.question, { text: turn.answer, citations: turn.citations }));
 };
 
 const streamAnswer = async (question, pending) => {

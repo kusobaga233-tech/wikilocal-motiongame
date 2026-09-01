@@ -777,7 +777,20 @@ def test_root_serves_the_local_question_workspace(client) -> None:
 
     assert response.status_code == 200
     assert "WikiLocal" in response.text
-    assert "/assets/app.js" in response.text
+    assert "/assets/app.js?v=" in response.text
+
+
+def test_web_assets_use_browser_executable_media_types(client) -> None:
+    test_client, _settings, _documents, _chats = client
+
+    script = test_client.get("/assets/app.js")
+    stylesheet = test_client.get("/assets/styles.css")
+
+    assert script.status_code == 200
+    assert script.headers["content-type"].startswith("application/javascript")
+    assert script.headers["cache-control"] == "no-store"
+    assert stylesheet.status_code == 200
+    assert stylesheet.headers["content-type"].startswith("text/css")
 
 
 def test_web_renders_sync_errors_and_model_unavailability() -> None:
@@ -793,6 +806,7 @@ def test_web_loads_local_history_and_renders_citation_details() -> None:
 
     assert 'api("/conversations")' in web_script
     assert 'fetch("/api/answer/stream"' in web_script
+    assert "appendAnswer(turn.question, { text: turn.answer, citations: turn.citations })" in web_script
     assert "metadata.sender" in web_script
     assert "metadata.sent_at" in web_script
     assert "<details" in web_script

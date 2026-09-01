@@ -10,7 +10,6 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from wikilocal.feishu import FeishuClient
@@ -357,7 +356,17 @@ def create_app(
 
     web_directory = Path(__file__).resolve().parents[2] / "web"
     if web_directory.is_dir():
-        app.mount("/assets", StaticFiles(directory=web_directory), name="assets")
+        @app.get("/assets/app.js", include_in_schema=False)
+        def web_script() -> FileResponse:
+            return FileResponse(
+                web_directory / "app.js",
+                media_type="application/javascript",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @app.get("/assets/styles.css", include_in_schema=False)
+        def web_styles() -> FileResponse:
+            return FileResponse(web_directory / "styles.css", media_type="text/css")
 
         @app.get("/", include_in_schema=False)
         def web_app() -> FileResponse:
