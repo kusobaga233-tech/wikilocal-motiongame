@@ -224,6 +224,8 @@ def _chat_pages(fetch: Any) -> list[dict[str, Any]]:
         if not isinstance(page, dict):
             raise TypeError("Feishu chat page must be an object.")
         values = page.get("items", page.get("chats", []))
+        if values is None and not page.get("has_more"):
+            values = []
         if not isinstance(values, list):
             raise TypeError("Feishu chat page must contain chats.")
         chats.extend(value for value in values if isinstance(value, dict))

@@ -576,3 +576,21 @@ class ChatSynchronizerTests(unittest.TestCase):
 
         self.assertEqual(result.failed, 1)
         self.assertEqual(storage.get_checkpoint("chat:oc-1"), checkpoint)
+
+    def test_chat_enumeration_accepts_a_null_final_chat_page(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeChatFeishu()
+        feishu.chat_pages = {
+            None: {
+                "chats": [{"chat_id": "oc-1", "name": "Roadmap"}],
+                "has_more": True,
+                "page_token": "final",
+            },
+            "final": {"chats": None, "has_more": False, "page_token": ""},
+        }
+        feishu.pages = {None: {"messages": [], "has_more": False}}
+
+        result = ChatSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual((result.created, result.failed), (0, 0))
+        self.assertEqual(feishu.message_calls, [("oc-1", None, None)])
