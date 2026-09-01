@@ -1,31 +1,42 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from collections.abc import Callable, Mapping
-from pathlib import Path
+import json
 import sys
+from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from wikilocal.feishu import FeishuClient
-from wikilocal.indexing import Indexer
+from wikilocal.indexing import Indexer, LanceDBVectorStore
 from wikilocal.ollama import ModelUnavailableError, OllamaClient
 from wikilocal.retrieval import AnswerService, Retriever
 from wikilocal.scheduler import reconfigure_daily_task_if_installed
 from wikilocal.settings import Settings, SettingsError
-from wikilocal.storage import SourceRecord, Storage
+from wikilocal.storage import SourceRecord, Storage, SyncStateSnapshot
 from wikilocal.sync_chats import ChatSynchronizer
 from wikilocal.sync_documents import DocumentSynchronizer, SyncResult
-
 
 SyncKind = Literal["documents", "chats", "all"]
 MODEL_NAMES = {"answer": "qwen3:4b", "embedding": "bge-m3", "reranker": "bge-reranker-v2-m3"}
 ModelStatusProvider = Callable[[], Mapping[str, bool]]
 ScheduleReconfigurer = Callable[[Settings], bool]
+
+
+class SyncResultFailure(RuntimeError):
+    """Raised when a synchronizer reports failed work without raising itself."""
+
+
+class _SyncSnapshot:
+    def __init__(self, storage: SyncStateSnapshot, mirrors: dict[Path, bytes]) -> None:
+        self.storage = storage
+        self.mirrors = mirrors
 
 
 class AnswerRequest(BaseModel):
@@ -55,10 +66,8 @@ class Runtime:
         self.document_synchronizer = document_synchronizer
         self.chat_synchronizer = chat_synchronizer
         self.indexer = indexer
-        self.last_sync: dict[str, dict[str, int | str | None]] = {
-            "documents": _empty_sync_status(),
-            "chats": _empty_sync_status(),
-        }
+        self.last_sync = storage.load_sync_status()
+        self.conversation_history = ConversationHistory(settings.root / "data" / "conversations")
 
     def synchronize(
         self, kind: SyncKind, *, honor_enabled: bool = False
@@ -75,15 +84,16 @@ class Runtime:
                 if (name == "documents" and self.settings.documents_enabled)
                 or (name == "chats" and self.settings.chats_enabled)
         )
+        snapshot = _snapshot_sync_state(self.storage, self.settings.root / "data" / "documents")
         total = SyncResult()
         completed: list[tuple[str, Any]] = []
         for name, synchronizer in selected:
             try:
                 result = synchronizer.sync()
             except Exception as error:
-                self.last_sync[name] = _failed_sync_status(error)
+                _restore_sync_state(self.storage, self.settings.root / "data" / "documents", snapshot)
+                self._record_sync_status(name, _failed_sync_status(error))
                 raise
-            self.last_sync[name] = _sync_result_dict(result)
             total = total.add(
                 created=int(result.created),
                 changed=int(result.changed),
@@ -91,31 +101,101 @@ class Runtime:
                 failed=int(result.failed),
             )
             completed.append((name, result))
-        if self.indexer is not None and total.failed == 0:
+        if total.failed:
+            error = SyncResultFailure()
+            _restore_sync_state(self.storage, self.settings.root / "data" / "documents", snapshot)
+            for name, result in completed:
+                self._record_sync_status(name, _failed_result_status(result, error))
+            raise error
+        if self.indexer is not None:
             try:
+                self._retry_disabled_vector_recovery()
                 for source in self.storage.list_sources(active_only=True):
-                    if source.text_content:
-                        self.indexer.index_source(source.source_key)
+                    self.indexer.index_source(source.source_key)
             except Exception as error:
+                _restore_sync_state(self.storage, self.settings.root / "data" / "documents", snapshot)
+                self._recover_vectors_after_rollback()
                 for name, result in completed:
-                    self.last_sync[name] = _failed_result_status(result, error)
+                    self._record_sync_status(name, _failed_result_status(result, error))
                 raise
+        for name, result in completed:
+            self._record_sync_status(name, _sync_result_dict(result))
         return _sync_result_dict(total)
+
+    def _record_sync_status(self, name: str, status: dict[str, int | str | None]) -> None:
+        self.last_sync[name] = status
+        self.storage.save_sync_status(self.last_sync)
+
+    def _recover_vectors_after_rollback(self) -> None:
+        if self.indexer is None:
+            return
+        rebuild = getattr(self.indexer, "rebuild_vectors_from_fts", None)
+        if not callable(rebuild):
+            return
+        try:
+            rebuild()
+        except Exception:  # noqa: BLE001
+            # The indexer has disabled vector search; preserve the original sync failure.
+            return
+
+    def _retry_disabled_vector_recovery(self) -> None:
+        if self.indexer is None:
+            return
+        retry = getattr(self.indexer, "retry_disabled_vector_recovery", None)
+        if callable(retry):
+            retry()
+
+
+class ConversationHistory:
+    """Append-only local UI history; no conversation content leaves the data directory."""
+
+    def __init__(self, directory: Path) -> None:
+        self._path = directory / "history.jsonl"
+
+    def load(self) -> list[dict[str, object]]:
+        if not self._path.is_file():
+            return []
+        turns: list[dict[str, object]] = []
+        for line in self._path.read_text(encoding="utf-8").splitlines():
+            try:
+                turn = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if _valid_conversation_turn(turn):
+                turns.append(turn)
+        return turns
+
+    def append(self, question: str, answer: str, citations: list[dict[str, object]]) -> dict[str, object]:
+        turn: dict[str, object] = {
+            "question": question,
+            "answer": answer,
+            "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+            "citations": citations,
+        }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a", encoding="utf-8", newline="\n") as history_file:
+            history_file.write(json.dumps(turn, ensure_ascii=False, separators=(",", ":")) + "\n")
+        return turn
 
 
 def create_runtime(settings: Settings) -> Runtime:
     storage = Storage(settings)
     storage.initialize()
-    feishu = FeishuClient()
-    ollama = OllamaClient()
-    return Runtime(
-        settings=settings,
-        storage=storage,
-        answer_service=AnswerService(Retriever(storage, ollama), ollama),
-        document_synchronizer=DocumentSynchronizer(settings, storage, feishu),
-        chat_synchronizer=ChatSynchronizer(settings, storage, feishu),
-        indexer=Indexer(storage, ollama),
-    )
+    try:
+        feishu = FeishuClient()
+        ollama = OllamaClient()
+        vector_store = LanceDBVectorStore.open(settings.database_path.parent / "lancedb")
+        return Runtime(
+            settings=settings,
+            storage=storage,
+            answer_service=AnswerService(Retriever(storage, ollama, vector_store), ollama),
+            document_synchronizer=DocumentSynchronizer(settings, storage, feishu),
+            chat_synchronizer=ChatSynchronizer(settings, storage, feishu),
+            indexer=Indexer(storage, ollama, vector_store),
+        )
+    except Exception:
+        storage.close()
+        raise
 
 
 def create_app(
@@ -214,7 +294,7 @@ def create_app(
         try:
             return runtime.synchronize(kind, honor_enabled=False)  # type: ignore[arg-type]
         except (ModelUnavailableError, RuntimeError, ValueError) as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
+            raise HTTPException(status_code=503, detail=_sync_error_message(error)) from error
 
     @app.get("/api/sync/status")
     def sync_status() -> dict[str, object]:
@@ -229,7 +309,39 @@ def create_app(
             result = runtime.answer_service.answer(question)
         except ModelUnavailableError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
-        return {"text": result.text, "citations": [_evidence_dict(item) for item in result.citations]}
+        citations = [_evidence_dict(item) for item in result.citations]
+        runtime.conversation_history.append(question, result.text, citations)
+        return {"text": result.text, "citations": citations}
+
+    @app.post("/api/answer/stream")
+    def stream_answer(payload: AnswerRequest) -> StreamingResponse:
+        question = payload.question.strip()
+        if not question:
+            raise HTTPException(status_code=422, detail="question must not be empty")
+        try:
+            chunks, evidence = _streaming_answer(runtime.answer_service, question)
+        except ModelUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        citations = [_evidence_dict(item) for item in evidence]
+
+        def stream() -> Any:
+            parts: list[str] = []
+            try:
+                for chunk in chunks:
+                    parts.append(chunk)
+                    yield _ndjson_event({"type": "delta", "text": chunk})
+            except ModelUnavailableError as error:
+                yield _ndjson_event({"type": "error", "detail": str(error)})
+                return
+            text = "".join(parts)
+            runtime.conversation_history.append(question, text, citations)
+            yield _ndjson_event({"type": "answer", "text": text, "citations": citations})
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    @app.get("/api/conversations")
+    def conversations() -> dict[str, object]:
+        return {"turns": runtime.conversation_history.load()}
 
     @app.get("/api/sources")
     def sources(query: str = "", limit: int = 100) -> dict[str, object]:
@@ -298,6 +410,29 @@ def _sync_error_message(error: Exception) -> str:
     return f"Synchronization failed ({type(error).__name__})."
 
 
+def _snapshot_sync_state(storage: Storage, mirror_directory: Path) -> _SyncSnapshot:
+    mirrors = {
+        path.relative_to(mirror_directory): path.read_bytes()
+        for path in mirror_directory.rglob("*")
+        if path.is_file()
+    } if mirror_directory.is_dir() else {}
+    return _SyncSnapshot(storage.snapshot_sync_state(), mirrors)
+
+
+def _restore_sync_state(storage: Storage, mirror_directory: Path, snapshot: _SyncSnapshot) -> None:
+    storage.restore_sync_state(snapshot.storage)
+    if mirror_directory.is_dir():
+        for path in sorted(mirror_directory.rglob("*"), key=lambda value: len(value.parts), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+    for relative_path, content in snapshot.mirrors.items():
+        mirror = mirror_directory / relative_path
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        mirror.write_bytes(content)
+
+
 def _reconfigure_existing_schedule(settings: Settings) -> bool:
     command = f'"{sys.executable}" -m wikilocal.cli sync --all'
     return reconfigure_daily_task_if_installed(settings, command)
@@ -322,6 +457,29 @@ def _evidence_dict(evidence: Any) -> dict[str, object]:
         "text_content": evidence.text_content,
         "metadata": dict(evidence.metadata),
     }
+
+
+def _streaming_answer(answer_service: Any, question: str) -> tuple[Any, tuple[Any, ...]]:
+    stream_answer = getattr(answer_service, "stream_answer", None)
+    if callable(stream_answer):
+        return stream_answer(question)
+    answer = answer_service.answer(question)
+    return iter((answer.text,)), answer.citations
+
+
+def _ndjson_event(event: Mapping[str, object]) -> str:
+    return json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def _valid_conversation_turn(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        isinstance(value.get("question"), str)
+        and isinstance(value.get("answer"), str)
+        and isinstance(value.get("timestamp"), str)
+        and isinstance(value.get("citations"), list)
+    )
 
 
 def _source_dict(source: SourceRecord) -> dict[str, object]:

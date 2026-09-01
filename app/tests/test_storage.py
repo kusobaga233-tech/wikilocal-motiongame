@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
@@ -63,6 +64,25 @@ class StorageTests(unittest.TestCase):
 
         self.assertEqual(storage.get_checkpoint("chat:oc_1"), cursor)
         self.assertIsNone(storage.get_checkpoint("chat:missing"))
+
+    def test_sync_status_round_trips_as_a_utf8_log_record(self) -> None:
+        storage = self.make_storage()
+        status = {
+            "documents": {"created": 1, "changed": 0, "skipped": 2, "failed": 0, "error": None},
+            "chats": {
+                "created": 0,
+                "changed": 0,
+                "skipped": 0,
+                "failed": 1,
+                "error": "Synchronization failed (RuntimeError).",
+            },
+        }
+
+        storage.save_sync_status(status)
+
+        self.assertEqual(storage.sync_status_path.parent, storage.database_path.parents[1] / "logs")
+        self.assertEqual(json.loads(storage.sync_status_path.read_text(encoding="utf-8")), status)
+        self.assertEqual(storage.load_sync_status(), status)
 
     def test_initialize_creates_required_tables(self) -> None:
         storage = self.make_storage()

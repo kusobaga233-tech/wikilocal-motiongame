@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
-from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -17,6 +17,7 @@ class InvalidOllamaBaseUrlError(ValueError):
 
 
 HttpTransport = Callable[[str, str, dict[str, object]], Mapping[str, object]]
+StreamingHttpTransport = Callable[[str, str, dict[str, object]], Iterable[Mapping[str, object]]]
 
 
 class OllamaClient:
@@ -25,9 +26,11 @@ class OllamaClient:
         *,
         base_url: str = "http://127.0.0.1:11434",
         transport: HttpTransport | None = None,
+        stream_transport: StreamingHttpTransport | None = None,
     ) -> None:
         self._base_url = _validate_loopback_base_url(base_url)
         self._transport = transport or self._http_request
+        self._stream_transport = stream_transport or self._http_stream
 
     def embed(self, texts: Sequence[str], *, model: str = "bge-m3") -> list[list[float]]:
         if not texts:
@@ -73,6 +76,28 @@ class OllamaClient:
             raise ModelUnavailableError("Local Ollama generation response is invalid.")
         return response
 
+    def generate_stream(self, model: str, prompt: str, *, num_ctx: int) -> Iterator[str]:
+        """Yield answer text from Ollama's local NDJSON generation endpoint."""
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"num_ctx": num_ctx},
+        }
+        try:
+            for item in self._stream_transport("POST", "/api/generate", payload):
+                response = item.get("response")
+                if not isinstance(response, str):
+                    raise ModelUnavailableError("Local Ollama streaming response is invalid.")
+                if response:
+                    yield response
+        except ModelUnavailableError:
+            raise
+        except (OSError, HTTPError, URLError, TimeoutError, TypeError, ValueError) as error:
+            raise ModelUnavailableError(
+                "Local Ollama is unavailable. Start Ollama and pull the required model."
+            ) from error
+
     def model_availability(self, models: Sequence[str]) -> dict[str, bool]:
         """Check whether the requested models exist in the local Ollama registry."""
         payload = self._call("GET", "/api/tags", {})
@@ -94,7 +119,7 @@ class OllamaClient:
     def _call(self, method: str, path: str, payload: dict[str, object]) -> Mapping[str, object]:
         try:
             response = self._transport(method, path, payload)
-        except (OSError, HTTPError, URLError, TimeoutError, ValueError) as error:
+        except (OSError, HTTPError, URLError, TimeoutError, TypeError, ValueError) as error:
             raise ModelUnavailableError("Local Ollama is unavailable. Start Ollama and pull the required model.") from error
         if not isinstance(response, Mapping):
             raise ModelUnavailableError("Local Ollama response is invalid.")
@@ -110,8 +135,27 @@ class OllamaClient:
         with urlopen(request, timeout=60) as response:  # nosec B310: validated loopback URL.
             decoded: Any = json.loads(response.read().decode("utf-8"))
         if not isinstance(decoded, Mapping):
-            raise ValueError("Ollama did not return a JSON object.")
+            raise TypeError("Ollama did not return a JSON object.")
         return decoded
+
+    def _http_stream(
+        self, method: str, path: str, payload: dict[str, object]
+    ) -> Iterator[Mapping[str, object]]:
+        request = Request(
+            f"{self._base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=60) as response:  # nosec B310: validated loopback URL.
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                decoded: Any = json.loads(line)
+                if not isinstance(decoded, Mapping):
+                    raise TypeError("Ollama did not return a JSON object.")
+                yield decoded
 
 
 def _validate_loopback_base_url(base_url: str) -> str:

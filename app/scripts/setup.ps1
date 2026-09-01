@@ -18,6 +18,28 @@ Set-Location $app
 & $python -m pip install --upgrade pip
 & $python -m pip install -e ".[test,vector]"
 
+$permissionPreflight = @'
+from wikilocal.feishu import FeishuClient, FeishuClientError
+import sys
+
+try:
+    result = FeishuClient().permission_preflight()
+except FeishuClientError as error:
+    print(f"Feishu permission preflight failed: {error}", file=sys.stderr)
+    sys.exit(1)
+
+if result.missing_scopes:
+    print("Feishu is missing required read-only scopes:", file=sys.stderr)
+    for scope in result.missing_scopes:
+        print(f"  {scope}", file=sys.stderr)
+    print("Remediate with:", file=sys.stderr)
+    for command in result.remediation_commands:
+        print(f"  {command}", file=sys.stderr)
+    sys.exit(1)
+'@
+& $python -c $permissionPreflight
+if ($LASTEXITCODE -ne 0) { throw "Feishu permission preflight failed. See missing scopes and remediation above." }
+
 New-Item -ItemType Directory -Force -Path $models | Out-Null
 $env:OLLAMA_MODELS = $models
 [Environment]::SetEnvironmentVariable("OLLAMA_MODELS", $models, "User")

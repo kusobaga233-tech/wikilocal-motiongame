@@ -9,7 +9,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-
 _CommandRunner = Callable[[tuple[str, ...]], str]
 LARK_CLI_TIMEOUT_SECONDS = 60
 
@@ -30,6 +29,7 @@ class FeishuClient:
         "im:chat:read",
         "im:message:readonly",
         "docx:document:readonly",
+        "drive:drive:readonly",
         "wiki:space:retrieve",
     )
 
@@ -75,7 +75,12 @@ class FeishuClient:
         _append_optional(command, "--end", end)
         return self.__read((*command, "--format", "json"))
 
-    def list_thread_messages(self, thread_id: str, *, page_token: str | None = None) -> Any:
+    def list_thread_messages(
+        self,
+        thread_id: str,
+        *,
+        page_token: str | None = None,
+    ) -> Any:
         command = [
             "lark-cli",
             "im",
@@ -107,6 +112,20 @@ class FeishuClient:
         command.extend(("--as", "user"))
         _append_optional(command, "--page-token", page_token)
         return self.__read((*command, "--format", "json"))
+
+    def list_personal_documents(
+        self, *, page_token: str | None = None, folder_token: str | None = None
+    ) -> Any:
+        command = ["lark-cli", "drive", "files", "list", "--as", "user"]
+        if folder_token is not None:
+            command[4:4] = ("--folder-token", _identifier(folder_token))
+        _append_optional(command, "--page-token", page_token)
+        payload = self.__read((*command, "--format", "json"))
+        if isinstance(payload, dict) and "page_token" not in payload:
+            next_page_token = payload.get("next_page_token")
+            if isinstance(next_page_token, str) and next_page_token:
+                return {**payload, "page_token": next_page_token}
+        return payload
 
     def read_document(self, document: str) -> Any:
         return self.__read(
@@ -170,6 +189,9 @@ class FeishuClient:
 
     @classmethod
     def __validate_read_command(cls, command: tuple[str, ...]) -> None:
+        if command[:4] == ("lark-cli", "drive", "files", "list"):
+            cls.__validate_personal_document_list_arguments(command[4:])
+            return
         prefix = command[:3]
         arguments = command[3:]
         if prefix == ("lark-cli", "im", "+chat-list"):
@@ -186,6 +208,18 @@ class FeishuClient:
             cls.__validate_document_fetch_arguments(arguments)
         else:
             raise FeishuClientError("Feishu command is not allowed.")
+
+    @staticmethod
+    def __validate_personal_document_list_arguments(arguments: tuple[str, ...]) -> None:
+        offset = 0
+        if arguments[:1] == ("--folder-token",):
+            if len(arguments) < 2:
+                raise FeishuClientError("Feishu command is not allowed.")
+            _identifier(arguments[1])
+            offset = 2
+        FeishuClient.__validate_optional_tail(
+            arguments, (*arguments[:offset], "--as", "user"), ("--page-token",)
+        )
 
     @staticmethod
     def __validate_chat_list_arguments(arguments: tuple[str, ...]) -> None:

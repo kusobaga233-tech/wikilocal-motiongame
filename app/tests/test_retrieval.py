@@ -28,6 +28,12 @@ class FakeOllama:
         self.assert_num_ctx = num_ctx
         return "The release changed the deployment date. [1]"
 
+    def generate_stream(self, model: str, prompt: str, *, num_ctx: int):
+        self.prompts.append(prompt)
+        self.assert_model = model
+        self.assert_num_ctx = num_ctx
+        return iter(("The release changed ", "the deployment date. [1]"))
+
 
 class FakeVectors:
     def search(self, embedding: list[float], limit: int) -> list[dict[str, object]]:
@@ -101,6 +107,10 @@ class RetrievalTests(unittest.TestCase):
         for index in range(8):
             source_key = f"document:vector{index:02d}"
             storage.upsert_source(SourceRecord(source_key, "document", f"Vector {index}", "body", {}, True))
+            storage.replace_fts_chunks(
+                source_key,
+                [(f"{source_key}:0:x", f"vector candidate {index}", f"Vector {index}")],
+            )
         vector_rows = [
             {
                 "chunk_id": f"document:vector{index:02d}:0:x",
@@ -123,6 +133,12 @@ class RetrievalTests(unittest.TestCase):
         storage = self.make_storage()
         storage.upsert_source(SourceRecord("document:active", "document", "Active", "body", {}, True))
         storage.upsert_source(SourceRecord("document:inactive", "document", "Inactive", "body", {}, False))
+        storage.replace_fts_chunks(
+            "document:active", [("document:active:0:x", "keyword active", "Active")]
+        )
+        storage.replace_fts_chunks(
+            "document:inactive", [("document:inactive:0:x", "keyword inactive", "Inactive")]
+        )
         vectors = ManyVectors([
             {
                 "chunk_id": "document:inactive:0:x",
@@ -141,6 +157,25 @@ class RetrievalTests(unittest.TestCase):
         results = Retriever(storage, FakeEmbeddingOllama(), vectors).search("keyword")
 
         self.assertEqual([item.source_key for item in results], ["document:active"])
+
+    def test_search_excludes_stale_vector_rows_not_present_in_current_fts(self) -> None:
+        storage = self.make_storage()
+        storage.upsert_source(SourceRecord("document:d1", "document", "Release", "new keyword", {}, True))
+        storage.replace_fts_chunks(
+            "document:d1", [("document:d1:0:new", "new keyword", "Release")]
+        )
+        vectors = ManyVectors([
+            {
+                "chunk_id": "document:d1:0:old",
+                "source_key": "document:d1",
+                "title": "Release",
+                "text_content": "old keyword",
+            }
+        ])
+
+        results = Retriever(storage, FakeEmbeddingOllama(), vectors).search("old")
+
+        self.assertEqual(results, [])
 
     def test_answer_keeps_citations_independent_from_model_text_and_uses_only_evidence(self) -> None:
         ollama = FakeOllama()
@@ -163,6 +198,27 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(ollama.assert_num_ctx, 8192)
         self.assertIn("Deployment date moved to Friday.", ollama.prompts[0])
         self.assertNotIn("unrelated", ollama.prompts[0].lower())
+
+    def test_stream_answer_keeps_citations_and_uses_the_local_generation_stream(self) -> None:
+        ollama = FakeOllama()
+        evidence = Evidence(
+            chunk_id="chat:m1:0:abc",
+            source_key="chat:m1",
+            title="Release chat",
+            text_content="Deployment date moved to Friday.",
+            metadata={"sender": "Mia", "timestamp": "2026-08-28T09:30:00+08:00"},
+        )
+
+        class StaticRetriever:
+            def search(self, question: str, limit: int = 8) -> list[Evidence]:
+                return [evidence]
+
+        chunks, citations = AnswerService(StaticRetriever(), ollama).stream_answer("What changed?")
+
+        self.assertEqual("".join(chunks), "The release changed the deployment date. [1]")
+        self.assertEqual(citations, (evidence,))
+        self.assertEqual(ollama.assert_model, "qwen3:4b")
+        self.assertIn("Deployment date moved to Friday.", ollama.prompts[0])
 
     def test_ollama_client_wraps_local_transport_failures_as_model_unavailable(self) -> None:
         def unavailable(method: str, path: str, body: dict[str, object]) -> dict[str, object]:

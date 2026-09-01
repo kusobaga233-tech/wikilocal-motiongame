@@ -71,6 +71,95 @@ class FeishuClientTests(unittest.TestCase):
 
         self.assertEqual(result, {"items": [{"message_id": "om_1"}]})
 
+    def test_list_personal_documents_constructs_a_read_only_user_command(self) -> None:
+        commands: list[tuple[str, ...]] = []
+
+        def runner(command: tuple[str, ...]) -> str:
+            commands.append(command)
+            return json.dumps({"ok": True, "data": {"files": []}})
+
+        client = FeishuClient(runner=runner)
+
+        self.assertEqual(client.list_personal_documents(), {"files": []})
+        self.assertEqual(
+            commands,
+            [
+                (
+                    "lark-cli",
+                    "drive",
+                    "files",
+                    "list",
+                    "--as",
+                    "user",
+                    "--format",
+                    "json",
+                )
+            ],
+        )
+
+    def test_list_personal_documents_normalizes_next_page_token(self) -> None:
+        client = FeishuClient(
+            runner=lambda command: json.dumps(
+                {
+                    "ok": True,
+                    "data": {"files": [], "has_more": True, "next_page_token": "drive-page-2"},
+                }
+            )
+        )
+
+        result = client.list_personal_documents()
+
+        self.assertEqual(result["page_token"], "drive-page-2")
+
+    def test_personal_drive_and_thread_reads_allow_only_safe_supported_values(self) -> None:
+        commands: list[tuple[str, ...]] = []
+
+        def runner(command: tuple[str, ...]) -> str:
+            commands.append(command)
+            return json.dumps({"ok": True, "data": {"items": []}})
+
+        client = FeishuClient(runner=runner)
+
+        client.list_personal_documents(page_token="drive-page-2", folder_token="folder-123")
+        client.list_thread_messages("omt_123", page_token="thread-page-2")
+        with self.assertRaises(TypeError):
+            client.list_thread_messages("omt_123", start="2026-08-01")
+
+        self.assertEqual(
+            commands,
+            [
+                (
+                    "lark-cli",
+                    "drive",
+                    "files",
+                    "list",
+                    "--folder-token",
+                    "folder-123",
+                    "--as",
+                    "user",
+                    "--page-token",
+                    "drive-page-2",
+                    "--format",
+                    "json",
+                ),
+                (
+                    "lark-cli",
+                    "im",
+                    "+threads-messages-list",
+                    "--thread",
+                    "omt_123",
+                    "--as",
+                    "user",
+                    "--order",
+                    "asc",
+                    "--page-token",
+                    "thread-page-2",
+                    "--format",
+                    "json",
+                ),
+            ],
+        )
+
     def test_public_methods_do_not_allow_identity_download_or_extra_cli_arguments(self) -> None:
         commands: list[tuple[str, ...]] = []
 
@@ -115,9 +204,10 @@ class FeishuClientTests(unittest.TestCase):
         )
 
         for command in commands:
-            with self.subTest(command=command[:3]):
-                with self.assertRaisesRegex(FeishuClientError, "not allowed"):
-                    read(command)
+            with self.subTest(command=command[:3]), self.assertRaisesRegex(
+                FeishuClientError, "not allowed"
+            ):
+                read(command)
 
     def test_private_read_dispatcher_rejects_unknown_flags_for_every_command(self) -> None:
         client = FeishuClient(
@@ -134,9 +224,10 @@ class FeishuClientTests(unittest.TestCase):
         )
 
         for command in commands:
-            with self.subTest(command=command[:3]):
-                with self.assertRaisesRegex(FeishuClientError, "not allowed"):
-                    read(command)
+            with self.subTest(command=command[:3]), self.assertRaisesRegex(
+                FeishuClientError, "not allowed"
+            ):
+                read(command)
 
     def test_private_read_dispatcher_allows_only_markdown_document_fetch(self) -> None:
         command = (
@@ -279,7 +370,7 @@ class FeishuClientTests(unittest.TestCase):
                     "identities": {
                         "user": {
                             "scope": "im:chat:read im:message:readonly "
-                            "docx:document:readonly wiki:space:retrieve"
+                            "docx:document:readonly wiki:space:retrieve drive:drive:readonly"
                         }
                     },
                 }
@@ -298,7 +389,7 @@ class FeishuClientTests(unittest.TestCase):
                     "identities": {
                         "user": {
                             "scope": "im:chat:read im:message:readonly "
-                            "docx:document:readonly wiki:space:retrieve"
+                            "docx:document:readonly wiki:space:retrieve drive:drive:readonly"
                         }
                     }
                 }
@@ -372,8 +463,9 @@ class FeishuClientTests(unittest.TestCase):
 
         for invalid_value in invalid_values:
             for invoke in invocations:
-                with self.subTest(value=repr(invalid_value), invocation=invocations.index(invoke)):
-                    with self.assertRaisesRegex(FeishuClientError, "invalid identifier"):
-                        invoke(invalid_value)
+                with self.subTest(
+                    value=repr(invalid_value), invocation=invocations.index(invoke)
+                ), self.assertRaisesRegex(FeishuClientError, "invalid identifier"):
+                    invoke(invalid_value)
 
         self.assertEqual(calls, [])

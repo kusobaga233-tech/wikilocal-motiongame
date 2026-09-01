@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, Protocol
 
 from wikilocal.settings import Settings
@@ -18,7 +18,7 @@ class SyncResult:
     skipped: int = 0
     failed: int = 0
 
-    def add(self, **counts: int) -> "SyncResult":
+    def add(self, **counts: int) -> SyncResult:
         return SyncResult(
             created=self.created + counts.get("created", 0),
             changed=self.changed + counts.get("changed", 0),
@@ -38,6 +38,10 @@ class DocumentReader(Protocol):
         page_token: str | None = None,
     ) -> Any: ...
 
+    def list_personal_documents(
+        self, *, page_token: str | None = None, folder_token: str | None = None
+    ) -> Any: ...
+
     def read_document(self, document: str) -> Any: ...
 
 
@@ -50,12 +54,14 @@ class DocumentSynchronizer:
     def sync(self) -> SyncResult:
         existing = {source.source_key: source for source in self._storage.list_sources()}
         seen_keys: set[str] = set()
+        revisions: dict[str, str] = {}
+        completed_revisions = _checkpoint_revisions(self._storage.get_checkpoint("documents"))
         result = SyncResult()
         successful_scan = True
 
         try:
             spaces = list(_pages(self._feishu.list_wiki_spaces))
-        except Exception:
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
             return result.add(failed=1)
 
         for space in spaces:
@@ -67,7 +73,7 @@ class DocumentSynchronizer:
             space_name = _text(space.get("name")) or space_id
             try:
                 nodes = self._walk_nodes(space_id, space_name)
-            except Exception:
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
                 successful_scan = False
                 result = result.add(failed=1)
                 continue
@@ -75,40 +81,106 @@ class DocumentSynchronizer:
                 token = _text(node.get("obj_token"))
                 if not token or _text(node.get("obj_type")) != "docx":
                     continue
-                source_key = f"document:{token}"
-                seen_keys.add(source_key)
-                try:
-                    payload = self._feishu.read_document(token)
-                    content = _document_content(payload)
-                    title = _text(node.get("title")) or token
-                    metadata = {
-                        "url": _text(node.get("url")) or _document_url(token),
-                        "wiki_path": wiki_path,
-                        "source_updated_at": _text(node.get("obj_edit_time"))
-                        or _text(node.get("update_time")),
-                    }
-                    source = SourceRecord(
-                        source_key=source_key,
-                        source_type="document",
-                        title=title,
-                        text_content=content,
-                        metadata=metadata,
-                        active=True,
-                    )
-                    outcome = _outcome(existing.get(source_key), source)
-                    self._write_mirror(token, source)
-                    self._storage.upsert_source(source)
-                    existing[source_key] = source
-                    result = result.add(**{outcome: 1})
-                except Exception:
-                    successful_scan = False
-                    result = result.add(failed=1)
+                metadata = {
+                    "url": _text(node.get("url")) or _document_url(token),
+                    "wiki_path": wiki_path,
+                    "source_scope": "wiki",
+                    "source_revision": _record_revision(node),
+                    "source_updated_at": _source_updated_at(node),
+                }
+                result, successful_scan = self._sync_document(
+                    token,
+                    _text(node.get("title")) or token,
+                    metadata,
+                    existing,
+                    completed_revisions,
+                    seen_keys,
+                    revisions,
+                    result,
+                    successful_scan,
+                )
+
+        personal_document_list = getattr(self._feishu, "list_personal_documents", None)
+        if callable(personal_document_list):
+            try:
+                personal_documents = _personal_documents(personal_document_list)
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+                return result.add(failed=1)
+            for document in personal_documents:
+                token = _text(document.get("token"))
+                if not token or _text(document.get("type")) != "docx":
+                    continue
+                metadata = {
+                    "url": _text(document.get("url")) or _document_url(token),
+                    "source_scope": "personal_library",
+                    "source_revision": _record_revision(document),
+                    "source_updated_at": _source_updated_at(document),
+                }
+                result, successful_scan = self._sync_document(
+                    token,
+                    _text(document.get("name")) or token,
+                    metadata,
+                    existing,
+                    completed_revisions,
+                    seen_keys,
+                    revisions,
+                    result,
+                    successful_scan,
+                )
+        elif any(
+            source.metadata.get("source_scope") == "personal_library"
+            for source in existing.values()
+        ):
+            successful_scan = False
+            result = result.add(failed=1)
 
         if not successful_scan:
             return result
 
-        self._storage.finalize_document_scan(seen_keys, {"completed_at": _now()})
+        self._storage.finalize_document_scan(
+            seen_keys, {"completed_at": _now(), "revisions": revisions}
+        )
         return result
+
+    def _sync_document(
+        self,
+        token: str,
+        title: str,
+        metadata: dict[str, str],
+        existing: dict[str, SourceRecord],
+        completed_revisions: dict[str, str],
+        seen_keys: set[str],
+        revisions: dict[str, str],
+        result: SyncResult,
+        successful_scan: bool,
+    ) -> tuple[SyncResult, bool]:
+        source_key = f"document:{token}"
+        if source_key in seen_keys:
+            return result, successful_scan
+        seen_keys.add(source_key)
+        revision = _source_revision(metadata)
+        if revision:
+            revisions[source_key] = revision
+        previous = existing.get(source_key)
+        if _can_skip_document(previous, source_key, revision, completed_revisions):
+            return result.add(skipped=1), successful_scan
+        try:
+            content = _document_content(self._feishu.read_document(token))
+            source = SourceRecord(
+                source_key=source_key,
+                source_type="document",
+                title=title,
+                text_content=content,
+                metadata=metadata,
+                active=True,
+            )
+            outcome = _outcome(previous, source)
+            self._write_mirror(token, source)
+            self._storage.upsert_source(source)
+            existing[source_key] = source
+            return result.add(**{outcome: 1}), successful_scan
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            return result.add(failed=1), False
 
     def _walk_nodes(self, space_id: str, space_name: str) -> list[tuple[dict[str, Any], str]]:
         result: list[tuple[dict[str, Any], str]] = []
@@ -158,10 +230,10 @@ def _pages(fetch: Any) -> list[dict[str, Any]]:
     while True:
         page = fetch(page_token=page_token)
         if not isinstance(page, dict):
-            raise ValueError("Feishu pagination response must be an object.")
+            raise TypeError("Feishu pagination response must be an object.")
         values = page.get("items", page.get("nodes", []))
         if not isinstance(values, list):
-            raise ValueError("Feishu pagination response must contain an item list.")
+            raise TypeError("Feishu pagination response must contain an item list.")
         items.extend(value for value in values if isinstance(value, dict))
         if not page.get("has_more"):
             return items
@@ -174,16 +246,61 @@ def _pages(fetch: Any) -> list[dict[str, Any]]:
         page_token = next_token
 
 
+def _personal_documents(fetch: Any) -> list[dict[str, Any]]:
+    documents: list[dict[str, Any]] = []
+    visited_folders: set[str] = set()
+
+    def visit(folder_token: str | None) -> None:
+        if folder_token is not None:
+            if folder_token in visited_folders:
+                return
+            visited_folders.add(folder_token)
+        page_token: str | None = None
+        seen_page_tokens: set[str] = set()
+        while True:
+            if folder_token is None:
+                payload = fetch(page_token=page_token)
+            else:
+                payload = fetch(page_token=page_token, folder_token=folder_token)
+            if not isinstance(payload, dict):
+                raise TypeError("Feishu personal library response must be an object.")
+            values = payload.get("files")
+            if not isinstance(values, list):
+                raise TypeError("Feishu personal library response must contain a file list.")
+            for document in values:
+                if not isinstance(document, dict):
+                    continue
+                if _text(document.get("type")) == "folder":
+                    child_folder_token = _text(document.get("token"))
+                    if not child_folder_token:
+                        raise ValueError("Feishu folder is missing its token.")
+                    visit(child_folder_token)
+                else:
+                    documents.append(document)
+            if not payload.get("has_more"):
+                return
+            next_token = _text(payload.get("next_page_token")) or _text(payload.get("page_token"))
+            if not next_token:
+                raise ValueError("Feishu personal library response is missing its next page token.")
+            if next_token in seen_page_tokens:
+                raise ValueError("Feishu personal library response repeated a page token.")
+            seen_page_tokens.add(next_token)
+            page_token = next_token
+
+    visit(None)
+    return documents
+
+
 def _is_container(node: dict[str, Any]) -> bool:
     return _text(node.get("obj_type")) in {"folder", "wiki"} or bool(node.get("has_child"))
 
 
 def _document_content(payload: Any) -> str:
     if not isinstance(payload, dict):
-        raise ValueError("Feishu document response must be an object.")
+        raise TypeError("Feishu document response must be an object.")
     document = payload.get("document")
     if not isinstance(document, dict) or not isinstance(document.get("content"), str):
-        raise ValueError("Feishu document response is missing Markdown content.")
+        raise TypeError("Feishu document response is missing Markdown content.")
     return _normalize_text(document["content"])
 
 
@@ -203,6 +320,49 @@ def _outcome(previous: SourceRecord | None, source: SourceRecord) -> str:
     ):
         return "skipped"
     return "changed"
+
+
+def _source_updated_at(record: dict[str, Any]) -> str:
+    return (
+        _text(record.get("obj_edit_time"))
+        or _text(record.get("update_time"))
+        or _text(record.get("modified_time"))
+    )
+
+
+def _record_revision(record: dict[str, Any]) -> str:
+    return _text(record.get("revision_id")) or _text(record.get("revision"))
+
+
+def _source_revision(metadata: dict[str, str]) -> str:
+    values = [
+        value
+        for value in (metadata["source_revision"], metadata["source_updated_at"])
+        if value
+    ]
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":")) if values else ""
+
+
+def _can_skip_document(
+    previous: SourceRecord | None,
+    source_key: str,
+    revision: str,
+    completed_revisions: dict[str, str],
+) -> bool:
+    return bool(previous and previous.active and revision and completed_revisions.get(source_key) == revision)
+
+
+def _checkpoint_revisions(checkpoint: Any) -> dict[str, str]:
+    if not isinstance(checkpoint, dict):
+        return {}
+    revisions = checkpoint.get("revisions")
+    if not isinstance(revisions, dict):
+        return {}
+    return {
+        source_key: revision
+        for source_key, revision in revisions.items()
+        if isinstance(source_key, str) and isinstance(revision, str) and revision
+    }
 
 
 def _text(value: Any) -> str:

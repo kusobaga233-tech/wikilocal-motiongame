@@ -20,7 +20,9 @@ class FakeChatFeishu:
         self.pages_by_request: dict[tuple[str, str | None, str | None], dict[str, object]] = {}
         self.message_errors_by_request: dict[tuple[str, str | None, str | None], Exception] = {}
         self.thread_pages: dict[tuple[str, str | None], dict[str, object]] = {}
+        self.thread_pages_by_request: dict[tuple[str, str | None], dict[str, object]] = {}
         self.message_calls: list[tuple[str, str | None, str | None]] = []
+        self.thread_calls: list[tuple[str, str | None]] = []
         self.chat_pages: dict[str | None, dict[str, object]] = {}
 
     def list_chats(self, *, page_token: str | None = None) -> dict[str, object]:
@@ -49,8 +51,14 @@ class FakeChatFeishu:
         return self.pages[page_token]
 
     def list_thread_messages(
-        self, thread_id: str, *, page_token: str | None = None
+        self,
+        thread_id: str,
+        *,
+        page_token: str | None = None,
     ) -> dict[str, object]:
+        self.thread_calls.append((thread_id, page_token))
+        if self.thread_pages_by_request:
+            return self.thread_pages_by_request[(thread_id, page_token)]
         return self.thread_pages[(thread_id, page_token)]
 
 
@@ -111,7 +119,11 @@ class ChatSynchronizerTests(unittest.TestCase):
         )
         self.assertEqual(
             storage.get_checkpoint("chat:oc-1"),
-            {"message_id": "m2", "sent_at": "2026-08-26T01:01:00Z"},
+            {
+                "message_id": "m2",
+                "sent_at": "2026-08-26T01:01:00Z",
+                "thread_ids": [],
+            },
         )
         self.assertEqual(feishu.message_calls[0], ("oc-1", None, None))
 
@@ -175,10 +187,94 @@ class ChatSynchronizerTests(unittest.TestCase):
                 "message_id": "m1",
                 "sent_at": "2026-08-26T01:00:00Z",
                 "thread_ids": ["omt-1"],
+                "thread_cursors": {
+                    "omt-1": {"message_id": "m2", "sent_at": "2026-08-26T02:00:00Z"}
+                },
             },
         )
 
-    def test_second_sync_reads_new_reply_from_known_thread_without_new_root_message(self) -> None:
+    def test_revised_and_recalled_messages_refresh_their_persisted_state(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeChatFeishu()
+        feishu.pages = {
+            None: {
+                "messages": [text_message("m1", "2026-08-26T01:00:00Z", "Original")],
+                "has_more": False,
+            }
+        }
+        synchronizer = ChatSynchronizer(settings, storage, feishu)
+
+        self.assertEqual(synchronizer.sync().created, 1)
+
+        revised = text_message("m1", "2026-08-26T01:00:00Z", "Revised")
+        revised["update_time"] = "2026-08-26T02:00:00Z"
+        feishu.pages = {None: {"messages": [revised], "has_more": False}}
+
+        revised_result = synchronizer.sync()
+
+        self.assertEqual((revised_result.changed, revised_result.failed), (1, 0))
+        revised_source = storage.get_source("message:m1")
+        self.assertIsNotNone(revised_source)
+        assert revised_source is not None
+        self.assertTrue(revised_source.active)
+        self.assertEqual(revised_source.text_content, "Revised\n")
+        self.assertEqual(revised_source.metadata["revision"], "2026-08-26T02:00:00Z")
+        self.assertFalse(revised_source.metadata["deleted"])
+
+        recalled = text_message("m1", "2026-08-26T01:00:00Z", "")
+        recalled["update_time"] = "2026-08-26T03:00:00Z"
+        recalled["deleted"] = True
+        feishu.pages = {None: {"messages": [recalled], "has_more": False}}
+
+        recalled_result = synchronizer.sync()
+
+        self.assertEqual((recalled_result.changed, recalled_result.failed), (1, 0))
+        recalled_source = storage.get_source("message:m1")
+        self.assertIsNotNone(recalled_source)
+        assert recalled_source is not None
+        self.assertFalse(recalled_source.active)
+        self.assertEqual(recalled_source.text_content, "")
+        self.assertEqual(recalled_source.metadata["revision"], "2026-08-26T03:00:00Z")
+        self.assertTrue(recalled_source.metadata["deleted"])
+
+    def test_old_message_revisions_are_reconciled_from_the_configured_history_start(self) -> None:
+        settings, storage = self.make_storage()
+        settings.chat_history_start = "2026-01-01"
+        feishu = FakeChatFeishu()
+        original = text_message("m1", "2026-01-02T01:00:00Z", "Original")
+        newer = text_message("m2", "2026-02-01T01:00:00Z", "Newer")
+        feishu.pages_by_request = {
+            ("oc-1", None, "2026-01-01"): {
+                "messages": [original, newer],
+                "has_more": False,
+            }
+        }
+        synchronizer = ChatSynchronizer(settings, storage, feishu)
+
+        self.assertEqual(synchronizer.sync().created, 2)
+
+        recalled = text_message("m1", "2026-01-02T01:00:00Z", "")
+        recalled["update_time"] = "2026-03-01T01:00:00Z"
+        recalled["recalled"] = True
+        feishu.message_calls.clear()
+        feishu.pages_by_request = {
+            ("oc-1", None, "2026-01-01"): {
+                "messages": [recalled, newer],
+                "has_more": False,
+            }
+        }
+
+        result = synchronizer.sync()
+
+        self.assertEqual((result.changed, result.skipped, result.failed), (1, 1, 0))
+        self.assertEqual(feishu.message_calls, [("oc-1", None, "2026-01-01")])
+        source = storage.get_source("message:m1")
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertFalse(source.active)
+        self.assertTrue(source.metadata["deleted"])
+
+    def test_known_thread_rescans_full_history_and_idempotently_upserts_replies(self) -> None:
         settings, storage = self.make_storage()
         feishu = FakeChatFeishu()
         feishu.pages = {
@@ -189,43 +285,52 @@ class ChatSynchronizerTests(unittest.TestCase):
                 "has_more": False,
             }
         }
-        feishu.thread_pages = {
-            ("omt-1", None): {"messages": [], "has_more": False},
+        feishu.thread_pages_by_request = {
+            ("omt-1", None): {
+                "messages": [text_message("m2", "2026-08-26T01:01:00Z", "First reply")],
+                "has_more": True,
+                "page_token": "older",
+            },
+            ("omt-1", "older"): {
+                "messages": [text_message("m3", "2026-08-26T01:02:00Z", "Second reply")],
+                "has_more": False,
+            },
         }
         synchronizer = ChatSynchronizer(settings, storage, feishu)
 
         first_result = synchronizer.sync()
 
-        self.assertEqual((first_result.created, first_result.failed), (1, 0))
+        self.assertEqual((first_result.created, first_result.failed), (3, 0))
         self.assertEqual(
             storage.get_checkpoint("chat:oc-1"),
             {
                 "message_id": "m1",
                 "sent_at": "2026-08-26T01:00:00Z",
                 "thread_ids": ["omt-1"],
+                "thread_cursors": {
+                    "omt-1": {"message_id": "m3", "sent_at": "2026-08-26T01:02:00Z"}
+                },
             },
         )
 
         feishu.pages = {None: {"messages": [], "has_more": False}}
-        feishu.thread_pages = {
+        feishu.thread_calls.clear()
+        feishu.thread_pages_by_request = {
             ("omt-1", None): {
-                "messages": [
-                    text_message("m1", "2026-08-26T01:00:00Z", "Root"),
-                    text_message("m2", "2026-08-26T02:00:00Z", "New reply"),
-                ],
+                "messages": [text_message("m4", "2026-08-26T02:00:00Z", "New reply")],
                 "has_more": False,
-            },
+            }
         }
 
         second_result = synchronizer.sync()
 
         self.assertEqual(
             (second_result.created, second_result.changed, second_result.skipped, second_result.failed),
-            (1, 0, 1, 0),
+            (1, 0, 0, 0),
         )
         self.assertEqual(
             [source.source_key for source in storage.list_sources(active_only=True)],
-            ["message:m1", "message:m2"],
+            ["message:m1", "message:m2", "message:m3", "message:m4"],
         )
         self.assertEqual(
             storage.get_checkpoint("chat:oc-1"),
@@ -233,9 +338,45 @@ class ChatSynchronizerTests(unittest.TestCase):
                 "message_id": "m1",
                 "sent_at": "2026-08-26T01:00:00Z",
                 "thread_ids": ["omt-1"],
+                "thread_cursors": {
+                    "omt-1": {"message_id": "m4", "sent_at": "2026-08-26T02:00:00Z"}
+                },
             },
         )
-        self.assertEqual(feishu.message_calls[-1], ("oc-1", None, "2026-08-26T01:00:00Z"))
+        self.assertEqual(feishu.message_calls[-1], ("oc-1", None, None))
+        self.assertEqual(feishu.thread_calls, [("omt-1", None)])
+
+    def test_thread_root_seeds_cursor_when_its_initial_reply_page_is_empty(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeChatFeishu()
+        feishu.pages = {
+            None: {
+                "messages": [text_message("m1", "2026-08-26T01:00:00Z", "Root", thread_id="omt-1")],
+                "has_more": False,
+            }
+        }
+        feishu.thread_pages_by_request = {
+            ("omt-1", None): {"messages": [], "has_more": False}
+        }
+        synchronizer = ChatSynchronizer(settings, storage, feishu)
+
+        synchronizer.sync()
+
+        self.assertEqual(
+            storage.get_checkpoint("chat:oc-1")["thread_cursors"],
+            {"omt-1": {"message_id": "m1", "sent_at": "2026-08-26T01:00:00Z"}},
+        )
+
+        feishu.pages = {None: {"messages": [], "has_more": False}}
+        feishu.thread_calls.clear()
+        feishu.thread_pages_by_request = {
+            ("omt-1", None): {"messages": [], "has_more": False}
+        }
+
+        result = synchronizer.sync()
+
+        self.assertEqual((result.created, result.failed), (0, 0))
+        self.assertEqual(feishu.thread_calls, [("omt-1", None)])
 
     def test_legacy_checkpoint_discovers_old_thread_and_stores_new_reply_once(self) -> None:
         settings, storage = self.make_storage()
@@ -249,10 +390,6 @@ class ChatSynchronizerTests(unittest.TestCase):
                 "messages": [text_message("m1", "2026-08-26T01:00:00Z", "Old root", thread_id="omt-1")],
                 "has_more": False,
             },
-            ("oc-1", None, "2026-08-26T01:00:00Z"): {
-                "messages": [],
-                "has_more": False,
-            },
         }
         feishu.thread_pages = {
             ("omt-1", None): {
@@ -264,28 +401,33 @@ class ChatSynchronizerTests(unittest.TestCase):
 
         result = synchronizer.sync()
 
-        self.assertEqual((result.created, result.failed), (1, 0))
+        self.assertEqual((result.created, result.failed), (2, 0))
         self.assertEqual(
             storage.get_checkpoint("chat:oc-1"),
             {
                 "message_id": "m1",
                 "sent_at": "2026-08-26T01:00:00Z",
                 "thread_ids": ["omt-1"],
+                "thread_cursors": {
+                    "omt-1": {"message_id": "m2", "sent_at": "2026-08-26T02:00:00Z"}
+                },
                 "thread_discovery_complete": True,
             },
         )
         self.assertEqual(
             feishu.message_calls,
-            [("oc-1", None, None), ("oc-1", None, "2026-08-26T01:00:00Z")],
+            [("oc-1", None, None), ("oc-1", None, None)],
         )
 
         feishu.message_calls.clear()
+        feishu.thread_calls.clear()
         feishu.thread_pages = {("omt-1", None): {"messages": [], "has_more": False}}
 
         second_result = synchronizer.sync()
 
         self.assertEqual((second_result.created, second_result.failed), (0, 0))
-        self.assertEqual(feishu.message_calls, [("oc-1", None, "2026-08-26T01:00:00Z")])
+        self.assertEqual(feishu.message_calls, [("oc-1", None, None)])
+        self.assertEqual(feishu.thread_calls, [("omt-1", None)])
 
     def test_legacy_discovery_failure_keeps_checkpoint_unmigrated(self) -> None:
         settings, storage = self.make_storage()
@@ -341,7 +483,7 @@ class ChatSynchronizerTests(unittest.TestCase):
             chat_id: str, *, page_token: str | None = None, start: str | None = None, end: str | None = None
         ) -> dict[str, object]:
             nonlocal calls
-            self.assertEqual((chat_id, start, end), ("oc-1", "2026-08-26T01:00:00Z", None))
+            self.assertEqual((chat_id, start, end), ("oc-1", None, None))
             calls += 1
             return (
                 {"messages": [], "has_more": True, "page_token": "loop"}
@@ -391,7 +533,7 @@ class ChatSynchronizerTests(unittest.TestCase):
         storage.set_checkpoint("chat:oc-1", checkpoint)
         feishu = FakeChatFeishu()
         feishu.pages_by_request = {
-            ("oc-1", None, "2026-08-26T01:00:00Z"): {"messages": [], "has_more": False},
+            ("oc-1", None, None): {"messages": [], "has_more": False},
         }
         calls = 0
 

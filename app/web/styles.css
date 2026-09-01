@@ -28,10 +28,13 @@ h1 { margin: 0; font-size: 22px; font-weight: 650; }
 .user-turn { margin-left: auto; background: #1d4e43; }
 .answer-turn { background: #17211e; border: 1px solid #2e3a35; }
 .citations { margin-top: 12px; border-top: 1px solid #35423d; padding-top: 8px; }
-.citation { padding: 5px 0; color: #c9ddd4; }
+.citation { padding: 7px 0; color: #c9ddd4; }
 .citation summary { cursor: pointer; color: #7ed7bc; }
 .citation p { margin: 8px 0 0; color: #b6c1bb; font-size: 13px; }
 .citation a { color: inherit; }
+.citation-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 7px; color: #96aaa0; font-size: 12px; }
+.citation-meta time { font-variant-numeric: tabular-nums; }
+.is-streaming .answer-text:empty::after { content: "..."; color: #8ea098; }
 .question-form { display: flex; gap: 10px; padding-top: 16px; }
 textarea, input[type="search"], input[type="time"], input[type="date"] { width: 100%; color: #eaf0ed; background: #17201d; border: 1px solid #425049; border-radius: 4px; padding: 10px; outline: none; }
 textarea:focus, input:focus { border-color: #62baa0; }

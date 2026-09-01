@@ -6,12 +6,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from wikilocal.settings import Settings
 from wikilocal.storage import Storage
-from wikilocal.sync_documents import DocumentSynchronizer
+from wikilocal.sync_documents import DocumentSynchronizer, SyncResult
 
 
 class FakeDocumentFeishu:
@@ -42,6 +43,13 @@ class FakeDocumentFeishu:
             }
         }
         self.fail_documents: set[str] = set()
+        self.fail_personal_document_listing = False
+        self.personal_documents: list[dict[str, object]] = []
+        self.personal_pages: dict[str | None, dict[str, object]] = {}
+        self.personal_calls: list[str | None] = []
+        self.personal_folder_pages: dict[tuple[str, str | None], dict[str, object]] = {}
+        self.personal_folder_calls: list[tuple[str, str | None]] = []
+        self.read_document_calls: list[str] = []
 
     def list_wiki_spaces(self, *, page_token: str | None = None) -> dict[str, object]:
         assert page_token is None
@@ -62,7 +70,21 @@ class FakeDocumentFeishu:
             return {"items": self.nodes[1:]}
         return {"items": []}
 
+    def list_personal_documents(
+        self, *, page_token: str | None = None, folder_token: str | None = None
+    ) -> dict[str, object]:
+        if folder_token is not None:
+            self.personal_folder_calls.append((folder_token, page_token))
+            return self.personal_folder_pages[(folder_token, page_token)]
+        self.personal_calls.append(page_token)
+        if self.fail_personal_document_listing:
+            raise RuntimeError("personal library listing failed")
+        if self.personal_pages:
+            return self.personal_pages[page_token]
+        return {"files": self.personal_documents}
+
     def read_document(self, document: str) -> dict[str, object]:
+        self.read_document_calls.append(document)
         if document in self.fail_documents:
             raise RuntimeError("fetch failed")
         return self.documents[document]
@@ -87,7 +109,7 @@ class DocumentSynchronizerTests(unittest.TestCase):
         self.assertEqual(result.created, 1)
         self.assertEqual(result.changed, 0)
         self.assertEqual(result.failed, 0)
-        content_hash = hashlib.sha256("First line\nSecond line\n".encode("utf-8")).hexdigest()
+        content_hash = hashlib.sha256(b"First line\nSecond line\n").hexdigest()
         self.assertEqual(
             self.mirror_path(settings, "d1").read_text(encoding="utf-8"),
             "---\n"
@@ -108,18 +130,142 @@ class DocumentSynchronizerTests(unittest.TestCase):
         self.assertEqual(source.metadata["source_updated_at"], "2026-08-26T02:00:00Z")
         self.assertIsNotNone(storage.get_checkpoint("documents"))
 
+    def test_initial_sync_imports_document_from_personal_library(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        feishu.personal_documents.append(
+            {
+                "token": "personal-1",
+                "type": "docx",
+                "name": "Personal notes",
+                "url": "https://example.test/docx/personal-1",
+                "modified_time": "2026-08-27T02:00:00Z",
+            }
+        )
+        feishu.documents["personal-1"] = {
+            "document": {"document_id": "personal-1", "content": "Private planning"}
+        }
+
+        result = DocumentSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual(result, SyncResult(created=2))
+        source = storage.get_source("document:personal-1")
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.title, "Personal notes")
+        self.assertEqual(source.text_content, "Private planning\n")
+        self.assertEqual(source.metadata["url"], "https://example.test/docx/personal-1")
+        self.assertEqual(source.metadata["source_updated_at"], "2026-08-27T02:00:00Z")
+
+    def test_sync_follows_personal_drive_pages_before_finalizing_the_scan(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        feishu.personal_pages = {
+            None: {
+                "files": [
+                    {
+                        "token": "personal-1",
+                        "type": "docx",
+                        "name": "First page",
+                        "modified_time": "2026-08-27T02:00:00Z",
+                    }
+                ],
+                "has_more": True,
+                "page_token": "drive-page-2",
+            },
+            "drive-page-2": {
+                "files": [
+                    {
+                        "token": "personal-2",
+                        "type": "docx",
+                        "name": "Second page",
+                        "modified_time": "2026-08-27T03:00:00Z",
+                    }
+                ],
+                "has_more": False,
+            },
+        }
+        feishu.documents.update(
+            {
+                "personal-1": {"document": {"document_id": "personal-1", "content": "One"}},
+                "personal-2": {"document": {"document_id": "personal-2", "content": "Two"}},
+            }
+        )
+
+        result = DocumentSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual(result, SyncResult(created=3))
+        self.assertEqual(feishu.personal_calls, [None, "drive-page-2"])
+        self.assertEqual(
+            {source.source_key for source in storage.list_sources(active_only=True)},
+            {"document:d1", "document:personal-1", "document:personal-2"},
+        )
+
+    def test_sync_recursively_follows_drive_folders_and_next_page_token(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        feishu.personal_documents = [
+            {"token": "folder-1", "type": "folder", "name": "Projects"},
+            {"token": "personal-1", "type": "docx", "name": "Root document"},
+        ]
+        feishu.personal_folder_pages = {
+            ("folder-1", None): {
+                "files": [{"token": "folder-2", "type": "folder", "name": "Nested"}],
+                "has_more": True,
+                "next_page_token": "folder-1-page-2",
+            },
+            ("folder-1", "folder-1-page-2"): {
+                "files": [{"token": "personal-2", "type": "docx", "name": "Nested document"}],
+                "has_more": False,
+            },
+            ("folder-2", None): {"files": [], "has_more": False},
+        }
+        feishu.documents.update(
+            {
+                "personal-1": {"document": {"document_id": "personal-1", "content": "Root"}},
+                "personal-2": {"document": {"document_id": "personal-2", "content": "Nested"}},
+            }
+        )
+
+        result = DocumentSynchronizer(settings, storage, feishu).sync()
+
+        self.assertEqual(result, SyncResult(created=3))
+        self.assertEqual(
+            feishu.personal_folder_calls,
+            [("folder-1", None), ("folder-2", None), ("folder-1", "folder-1-page-2")],
+        )
+        self.assertEqual(
+            {source.source_key for source in storage.list_sources(active_only=True)},
+            {"document:d1", "document:personal-1", "document:personal-2"},
+        )
+
     def test_sync_updates_changed_document_and_mirror(self) -> None:
         settings, storage = self.make_storage()
         feishu = FakeDocumentFeishu()
+        feishu.nodes.append(
+            {
+                "node_token": "node-d2",
+                "obj_token": "d2",
+                "obj_type": "docx",
+                "title": "Unchanged",
+                "url": "https://example.test/wiki/node-d2",
+                "obj_edit_time": "2026-08-26T02:00:00Z",
+            }
+        )
+        feishu.documents["d2"] = {"document": {"document_id": "d2", "content": "No change"}}
         synchronizer = DocumentSynchronizer(settings, storage, feishu)
         synchronizer.sync()
+        feishu.read_document_calls.clear()
         feishu.nodes[1]["obj_edit_time"] = "2026-08-27T02:00:00Z"
         feishu.documents["d1"]["document"]["content"] = "Revised body"
 
-        result = synchronizer.sync()
+        with patch.object(storage, "upsert_source", wraps=storage.upsert_source) as upsert_source:
+            result = synchronizer.sync()
 
-        self.assertEqual((result.created, result.changed, result.skipped, result.failed), (0, 1, 0, 0))
-        content_hash = hashlib.sha256("Revised body\n".encode("utf-8")).hexdigest()
+        self.assertEqual((result.created, result.changed, result.skipped, result.failed), (0, 1, 1, 0))
+        self.assertEqual(feishu.read_document_calls, ["d1"])
+        self.assertEqual(upsert_source.call_count, 1)
+        content_hash = hashlib.sha256(b"Revised body\n").hexdigest()
         self.assertEqual(
             self.mirror_path(settings, "d1").read_text(encoding="utf-8"),
             "---\n"
@@ -132,6 +278,35 @@ class DocumentSynchronizerTests(unittest.TestCase):
             "---\n\n"
             "# Release plan\n\nRevised body\n",
         )
+
+    def test_completed_checkpoint_skips_unchanged_document_reads_and_writes(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        synchronizer = DocumentSynchronizer(settings, storage, feishu)
+        synchronizer.sync()
+        feishu.read_document_calls.clear()
+
+        with patch.object(storage, "upsert_source", wraps=storage.upsert_source) as upsert_source:
+            result = synchronizer.sync()
+
+        self.assertEqual((result.created, result.changed, result.skipped, result.failed), (0, 0, 1, 0))
+        self.assertEqual(feishu.read_document_calls, [])
+        upsert_source.assert_not_called()
+
+    def test_changed_update_time_reloads_document_even_when_revision_id_is_unchanged(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        feishu.nodes[1]["revision_id"] = "revision-1"
+        synchronizer = DocumentSynchronizer(settings, storage, feishu)
+        synchronizer.sync()
+        feishu.read_document_calls.clear()
+        feishu.nodes[1]["obj_edit_time"] = "2026-08-27T02:00:00Z"
+        feishu.documents["d1"]["document"]["content"] = "Revised body"
+
+        result = synchronizer.sync()
+
+        self.assertEqual((result.created, result.changed, result.skipped, result.failed), (0, 1, 0, 0))
+        self.assertEqual(feishu.read_document_calls, ["d1"])
 
     def test_failed_full_scan_keeps_checkpoint_and_does_not_mark_missing_document_inactive(self) -> None:
         settings, storage = self.make_storage()
@@ -151,6 +326,7 @@ class DocumentSynchronizerTests(unittest.TestCase):
         synchronizer.sync()
         checkpoint = storage.get_checkpoint("documents")
         feishu.nodes = [feishu.nodes[1]]
+        feishu.nodes[0]["obj_edit_time"] = "2026-08-27T02:00:00Z"
         feishu.fail_documents.add("d1")
 
         result = synchronizer.sync()
@@ -182,6 +358,44 @@ class DocumentSynchronizerTests(unittest.TestCase):
         sources = {source.source_key: source for source in storage.list_sources()}
         self.assertFalse(sources["document:d2"].active)
         self.assertIsNotNone(storage.get_checkpoint("documents"))
+
+    def test_inaccessible_personal_library_keeps_absent_source_active_until_a_complete_scan(self) -> None:
+        settings, storage = self.make_storage()
+        feishu = FakeDocumentFeishu()
+        feishu.personal_documents.append(
+            {
+                "token": "personal-1",
+                "type": "docx",
+                "name": "Personal notes",
+                "modified_time": "2026-08-27T02:00:00Z",
+            }
+        )
+        feishu.documents["personal-1"] = {
+            "document": {"document_id": "personal-1", "content": "Keep me"}
+        }
+        synchronizer = DocumentSynchronizer(settings, storage, feishu)
+        synchronizer.sync()
+        checkpoint = storage.get_checkpoint("documents")
+        feishu.personal_documents.clear()
+        feishu.fail_personal_document_listing = True
+
+        result = synchronizer.sync()
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(storage.get_checkpoint("documents"), checkpoint)
+        source = storage.get_source("document:personal-1")
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertTrue(source.active)
+
+        feishu.fail_personal_document_listing = False
+        result = synchronizer.sync()
+
+        self.assertEqual(result.failed, 0)
+        source = storage.get_source("document:personal-1")
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertFalse(source.active)
 
     def test_repeated_document_page_token_fails_without_advancing_checkpoint(self) -> None:
         settings, storage = self.make_storage()

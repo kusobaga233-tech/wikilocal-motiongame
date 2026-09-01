@@ -64,18 +64,92 @@ const loadSettings = async () => {
   document.querySelector("#history-start").value = settings.chat_history_start || "";
 };
 
+const safeUrl = (value) => {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+  } catch {
+    return "";
+  }
+};
+
+const citationMarkup = (citation, index) => {
+  const metadata = citation.metadata || {};
+  const url = safeUrl(metadata.url);
+  const title = escapeHtml(citation.title);
+  const sender = metadata.sender ? `<span>${escapeHtml(metadata.sender)}</span>` : "";
+  const timestamp = metadata.sent_at ? `<time>${escapeHtml(metadata.sent_at)}</time>` : "";
+  const evidence = escapeHtml(citation.text_content);
+  const link = url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${title}</a>` : title;
+  return `<details class="citation"><summary>[${index + 1}] ${link}</summary><div class="citation-meta">${sender}${timestamp}</div><p>${evidence}</p></details>`;
+};
+
+const citationsMarkup = (citations) => citations.map(citationMarkup).join("")
+  || "<p class=\"muted\">未找到可引用的本地来源</p>";
+
+const scrollConversation = () => {
+  const conversation = document.querySelector("#conversation");
+  conversation.scrollTop = conversation.scrollHeight;
+};
+
 const appendAnswer = (question, answer) => {
   const conversation = document.querySelector("#conversation");
   conversation.querySelector(".empty-state")?.remove();
-  const citations = answer.citations.map((citation, index) => {
-    const url = citation.metadata?.url;
-    const title = escapeHtml(citation.title);
-    const evidence = escapeHtml(citation.text_content);
-    const link = url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${title}</a>` : title;
-    return `<details class="citation"><summary>[${index + 1}] ${link}</summary><p>${evidence}</p></details>`;
-  }).join("") || "<p class=\"muted\">未找到可引用的本地来源</p>";
-  conversation.insertAdjacentHTML("beforeend", `<article class="turn user-turn"><p>${escapeHtml(question)}</p></article><article class="turn answer-turn"><p>${escapeHtml(answer.text)}</p><div class="citations">${citations}</div></article>`);
-  conversation.scrollTop = conversation.scrollHeight;
+  conversation.insertAdjacentHTML("beforeend", `<article class="turn user-turn"><p>${escapeHtml(question)}</p></article><article class="turn answer-turn"><p class="answer-text">${escapeHtml(answer.text)}</p><div class="citations">${citationsMarkup(answer.citations || [])}</div></article>`);
+  scrollConversation();
+};
+
+const createPendingAnswer = (question) => {
+  const conversation = document.querySelector("#conversation");
+  conversation.querySelector(".empty-state")?.remove();
+  conversation.insertAdjacentHTML("beforeend", `<article class="turn user-turn"><p>${escapeHtml(question)}</p></article><article class="turn answer-turn is-streaming"><p class="answer-text"></p><div class="citations" hidden></div></article>`);
+  const answerTurn = conversation.lastElementChild;
+  return { userTurn: answerTurn.previousElementSibling, answerTurn };
+};
+
+const loadConversation = async () => {
+  const result = await api("/conversations");
+  result.turns.forEach((turn) => appendAnswer(turn.question, turn));
+};
+
+const streamAnswer = async (question, pending) => {
+  const response = await fetch("/api/answer/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question }),
+  });
+  if (response.status === 404 || !response.body) return false;
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail || "本地服务请求失败");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const answerText = pending.answerTurn.querySelector(".answer-text");
+  const citations = pending.answerTurn.querySelector(".citations");
+  let remainder = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    remainder += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = remainder.split("\n");
+    remainder = lines.pop();
+    for (const line of lines) {
+      if (!line) continue;
+      const event = JSON.parse(line);
+      if (event.type === "delta") {
+        answerText.textContent += event.text;
+        scrollConversation();
+      } else if (event.type === "answer") {
+        citations.innerHTML = citationsMarkup(event.citations || []);
+        citations.hidden = false;
+        pending.answerTurn.classList.remove("is-streaming");
+      } else if (event.type === "error") {
+        throw new Error(event.detail || "本地模型生成失败");
+      }
+    }
+    if (done) break;
+  }
+  return true;
 };
 
 document.querySelector("#question-form").addEventListener("submit", async (event) => {
@@ -86,7 +160,13 @@ document.querySelector("#question-form").addEventListener("submit", async (event
   const button = document.querySelector("#ask-button");
   button.disabled = true;
   try {
-    appendAnswer(question, await api("/answer", { method: "POST", body: JSON.stringify({ question }) }));
+    const pending = createPendingAnswer(question);
+    const streamed = await streamAnswer(question, pending);
+    if (!streamed) {
+      pending.userTurn.remove();
+      pending.answerTurn.remove();
+      appendAnswer(question, await api("/answer", { method: "POST", body: JSON.stringify({ question }) }));
+    }
     input.value = "";
   } catch (error) {
     toast(error.message, true);
@@ -138,7 +218,7 @@ document.querySelector("#source-search").addEventListener("input", (event) => {
   searchTimer = window.setTimeout(() => refreshSources(event.target.value).catch((error) => toast(error.message, true)), 200);
 });
 
-Promise.all([api("/health"), refreshSources(), refreshStatus(), loadSettings()])
+Promise.all([api("/health"), refreshSources(), refreshStatus(), loadSettings(), loadConversation()])
   .then(([health]) => {
     document.querySelector("#model-status").textContent = health.model_available
       ? `本地模型：${health.models.answer.name}`

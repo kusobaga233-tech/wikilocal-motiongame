@@ -30,9 +30,17 @@ class ChunkRecord:
     source_key: str
 
 
+@dataclass(frozen=True)
+class SyncStateSnapshot:
+    sources: tuple[tuple[Any, ...], ...]
+    checkpoints: tuple[tuple[Any, ...], ...]
+    chunks: tuple[tuple[Any, ...], ...]
+
+
 class Storage:
     def __init__(self, settings: Settings) -> None:
         self.database_path: Path = settings.database_path
+        self.sync_status_path: Path = settings.root / "data" / "logs" / "sync-status.json"
         self._connection: sqlite3.Connection | None = None
 
     def initialize(self) -> None:
@@ -77,6 +85,29 @@ class Storage:
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+
+    def save_sync_status(self, status: Mapping[str, Any]) -> None:
+        """Atomically save the latest sanitized sync status as UTF-8 JSON."""
+        self.sync_status_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.sync_status_path.with_suffix(".tmp")
+        temporary_path.write_text(
+            _json_dumps(_sanitize_sync_status(status)) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        temporary_path.replace(self.sync_status_path)
+
+    def load_sync_status(self) -> dict[str, dict[str, int | str | None]]:
+        if not self.sync_status_path.is_file():
+            return _empty_sync_status()
+        try:
+            with self.sync_status_path.open("r", encoding="utf-8") as status_file:
+                stored_status = json.load(status_file)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return _empty_sync_status()
+        if not isinstance(stored_status, Mapping):
+            return _empty_sync_status()
+        return _sanitize_sync_status(stored_status)
 
     def upsert_source(self, source: SourceRecord) -> None:
         metadata = dict(source.metadata)
@@ -176,6 +207,56 @@ class Storage:
             raise
         connection.commit()
 
+    def list_fts_chunk_ids(self, source_key: str) -> set[str]:
+        rows = self._connection_or_raise().execute(
+            "SELECT chunk_id FROM chunks_fts WHERE source_key = ?", (source_key,)
+        ).fetchall()
+        return {str(row["chunk_id"]) for row in rows}
+
+    def get_fts_chunks(self, chunk_ids: Sequence[str]) -> dict[str, ChunkRecord]:
+        if not chunk_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in chunk_ids)
+        rows = self._connection_or_raise().execute(
+            f"""
+            SELECT chunks_fts.chunk_id, chunks_fts.text_content, chunks_fts.title, chunks_fts.source_key
+            FROM chunks_fts
+            JOIN sources ON sources.source_key = chunks_fts.source_key
+            WHERE chunks_fts.chunk_id IN ({placeholders}) AND sources.active = 1
+            """,
+            tuple(chunk_ids),
+        ).fetchall()
+        return {
+            str(row["chunk_id"]): ChunkRecord(
+                chunk_id=str(row["chunk_id"]),
+                text_content=str(row["text_content"]),
+                title=str(row["title"]),
+                source_key=str(row["source_key"]),
+            )
+            for row in rows
+        }
+
+    def list_fts_chunks(self) -> list[ChunkRecord]:
+        """Return all active FTS chunks for rebuilding a derived vector index."""
+        rows = self._connection_or_raise().execute(
+            """
+            SELECT chunks_fts.chunk_id, chunks_fts.text_content, chunks_fts.title, chunks_fts.source_key
+            FROM chunks_fts
+            JOIN sources ON sources.source_key = chunks_fts.source_key
+            WHERE sources.active = 1
+            ORDER BY chunks_fts.chunk_id
+            """
+        ).fetchall()
+        return [
+            ChunkRecord(
+                chunk_id=str(row["chunk_id"]),
+                text_content=str(row["text_content"]),
+                title=str(row["title"]),
+                source_key=str(row["source_key"]),
+            )
+            for row in rows
+        ]
+
     def search_fts(self, query: str, *, limit: int = 20) -> list[ChunkRecord]:
         if not query.strip() or limit <= 0:
             return []
@@ -261,6 +342,67 @@ class Storage:
             raise
         connection.commit()
 
+    def snapshot_sync_state(self) -> SyncStateSnapshot:
+        """Capture local source and index rows before a sync/index unit of work."""
+        connection = self._connection_or_raise()
+        return SyncStateSnapshot(
+            sources=tuple(
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT source_key, source_type, title, text_content, metadata_json,
+                           active, content_hash, source_updated_at, synced_at
+                    FROM sources ORDER BY source_key
+                    """
+                )
+            ),
+            checkpoints=tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT checkpoint_key, cursor_json, updated_at FROM checkpoints ORDER BY checkpoint_key"
+                )
+            ),
+            chunks=tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT chunk_id, text_content, title, source_key FROM chunks_fts ORDER BY chunk_id"
+                )
+            ),
+        )
+
+    def restore_sync_state(self, snapshot: SyncStateSnapshot) -> None:
+        """Restore source, checkpoint, and FTS state after a failed sync/index unit."""
+        connection = self._connection_or_raise()
+        try:
+            connection.execute("BEGIN")
+            connection.execute("DELETE FROM chunks_fts")
+            connection.execute("DELETE FROM checkpoints")
+            connection.execute("DELETE FROM sources")
+            connection.executemany(
+                """
+                INSERT INTO sources (
+                    source_key, source_type, title, text_content, metadata_json,
+                    active, content_hash, source_updated_at, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                snapshot.sources,
+            )
+            connection.executemany(
+                "INSERT INTO checkpoints (checkpoint_key, cursor_json, updated_at) VALUES (?, ?, ?)",
+                snapshot.checkpoints,
+            )
+            connection.executemany(
+                """
+                INSERT INTO chunks_fts (chunk_id, text_content, title, source_key)
+                VALUES (?, ?, ?, ?)
+                """,
+                snapshot.chunks,
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        connection.commit()
+
     def _connection_or_raise(self) -> sqlite3.Connection:
         if self._connection is None:
             raise RuntimeError("Storage.initialize() must be called before use.")
@@ -268,7 +410,7 @@ class Storage:
 
 
 def _content_hash(source: SourceRecord) -> str:
-    content = "\0".join((source.source_type, source.title, source.text_content))
+    content = f"{source.source_type}\0{source.title}\0{source.text_content}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
@@ -278,3 +420,40 @@ def _json_dumps(value: Any) -> str:
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _empty_sync_status() -> dict[str, dict[str, int | str | None]]:
+    return {"documents": _empty_sync_outcome(), "chats": _empty_sync_outcome()}
+
+
+def _empty_sync_outcome() -> dict[str, int | str | None]:
+    return {"created": 0, "changed": 0, "skipped": 0, "failed": 0, "error": None}
+
+
+def _sanitize_sync_status(status: Mapping[str, Any]) -> dict[str, dict[str, int | str | None]]:
+    sanitized = _empty_sync_status()
+    for kind in sanitized:
+        outcome = status.get(kind)
+        if not isinstance(outcome, Mapping):
+            continue
+        sanitized[kind] = {
+            field: _nonnegative_count(outcome.get(field))
+            for field in ("created", "changed", "skipped", "failed")
+        }
+        sanitized[kind]["error"] = _sanitized_error(outcome.get("error"))
+    return sanitized
+
+
+def _nonnegative_count(value: Any) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _sanitized_error(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    prefix = "Synchronization failed ("
+    suffix = ")."
+    if not value.startswith(prefix) or not value.endswith(suffix):
+        return None
+    error_type = value[len(prefix) : -len(suffix)]
+    return value if error_type.isidentifier() else None

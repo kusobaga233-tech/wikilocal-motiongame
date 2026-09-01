@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, time
 from pathlib import Path
-
 
 _DAILY_TIME_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 _ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -32,7 +31,7 @@ class Settings:
         return self.root / "config" / "settings.json"
 
     @classmethod
-    def load(cls, root: Path) -> "Settings":
+    def load(cls, root: Path) -> Settings:
         root = Path(root)
         settings_path = root / "config" / "settings.json"
         if settings_path.exists():
@@ -87,7 +86,7 @@ class Settings:
                 f"Invalid daily_time in {config_path}: expected HH:MM in 24-hour time."
             )
         try:
-            datetime.strptime(self.daily_time, "%H:%M")
+            time.fromisoformat(self.daily_time)
         except ValueError as error:
             raise SettingsError(
                 f"Invalid daily_time in {config_path}: expected HH:MM in 24-hour time."

@@ -10,6 +10,35 @@ from wikilocal.ollama import OllamaClient
 
 
 class OllamaClientTests(unittest.TestCase):
+    def test_generate_stream_yields_valid_local_ollama_chunks(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        def stream_transport(method: str, path: str, payload: dict[str, object]):
+            calls.append((method, path, payload))
+            return iter(({"response": "Deployment "}, {"response": "moves Friday.", "done": True}))
+
+        client = OllamaClient(stream_transport=stream_transport)
+
+        self.assertEqual(
+            list(client.generate_stream("qwen3:4b", "local evidence", num_ctx=8192)),
+            ["Deployment ", "moves Friday."],
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "POST",
+                    "/api/generate",
+                    {
+                        "model": "qwen3:4b",
+                        "prompt": "local evidence",
+                        "stream": True,
+                        "options": {"num_ctx": 8192},
+                    },
+                )
+            ],
+        )
+
     def test_model_availability_uses_only_local_tags_response(self) -> None:
         calls: list[tuple[str, str, dict[str, object]]] = []
 

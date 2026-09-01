@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import sqlite3
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -30,6 +31,8 @@ class RetrievalModel(Protocol):
 
 class GenerationModel(Protocol):
     def generate(self, model: str, prompt: str, *, num_ctx: int) -> str: ...
+
+    def generate_stream(self, model: str, prompt: str, *, num_ctx: int) -> Iterator[str]: ...
 
 
 class SearchableVectorStore(Protocol):
@@ -75,7 +78,7 @@ class Retriever:
     def _from_fts(self, question: str) -> list[Evidence]:
         try:
             rows = self._storage.search_fts(question, limit=20)
-        except Exception:
+        except sqlite3.Error:
             return []
         return [evidence for row in rows if (evidence := self._from_chunk(row)) is not None]
 
@@ -93,19 +96,25 @@ class Retriever:
 
     def _from_vectors(self, rows: Sequence[Mapping[str, object]]) -> list[Evidence]:
         evidence: list[Evidence] = []
-        for row in rows:
-            required = ("chunk_id", "source_key", "title", "text_content")
-            if not all(isinstance(row.get(key), str) for key in required):
+        valid_rows = [
+            row
+            for row in rows
+            if all(isinstance(row.get(key), str) for key in ("chunk_id", "source_key", "title", "text_content"))
+        ]
+        current_chunks = self._storage.get_fts_chunks([str(row["chunk_id"]) for row in valid_rows])
+        for row in valid_rows:
+            chunk = current_chunks.get(str(row["chunk_id"]))
+            if chunk is None or chunk.source_key != row["source_key"]:
                 continue
-            source = self._storage.get_source(str(row["source_key"]))
-            if source is None or not source.active:
+            source = self._storage.get_source(chunk.source_key)
+            if source is None:
                 continue
             evidence.append(
                 Evidence(
-                    chunk_id=str(row["chunk_id"]),
-                    source_key=str(row["source_key"]),
-                    title=str(row["title"]),
-                    text_content=str(row["text_content"]),
+                    chunk_id=chunk.chunk_id,
+                    source_key=chunk.source_key,
+                    title=chunk.title,
+                    text_content=chunk.text_content,
                     metadata=source.metadata,
                 )
             )
@@ -118,12 +127,22 @@ class AnswerService:
         self._ollama = ollama
 
     def answer(self, question: str) -> Answer:
-        evidence = tuple(self._retriever.search(question, limit=8))
+        evidence = self._evidence(question)
         if not evidence:
             return Answer("Insufficient evidence in the local knowledge base to answer this question.", ())
         prompt = _answer_prompt(question, evidence)
         text = self._ollama.generate("qwen3:4b", prompt, num_ctx=8192)
         return Answer(text=text, citations=evidence)
+
+    def stream_answer(self, question: str) -> tuple[Iterator[str], tuple[Evidence, ...]]:
+        evidence = self._evidence(question)
+        if not evidence:
+            return iter(("Insufficient evidence in the local knowledge base to answer this question.",)), ()
+        prompt = _answer_prompt(question, evidence)
+        return self._ollama.generate_stream("qwen3:4b", prompt, num_ctx=8192), evidence
+
+    def _evidence(self, question: str) -> tuple[Evidence, ...]:
+        return tuple(self._retriever.search(question, limit=8))
 
 
 def _deduplicate(candidates: Sequence[Evidence]) -> list[Evidence]:

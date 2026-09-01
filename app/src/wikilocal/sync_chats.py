@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any, Protocol
 
 from wikilocal.settings import Settings
@@ -20,7 +21,12 @@ class ChatReader(Protocol):
         end: str | None = None,
     ) -> Any: ...
 
-    def list_thread_messages(self, thread_id: str, *, page_token: str | None = None) -> Any: ...
+    def list_thread_messages(
+        self,
+        thread_id: str,
+        *,
+        page_token: str | None = None,
+    ) -> Any: ...
 
 
 class ChatSynchronizer:
@@ -33,7 +39,7 @@ class ChatSynchronizer:
         result = SyncResult()
         try:
             chats = list(_chat_pages(self._feishu.list_chats))
-        except Exception:
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
             return result.add(failed=1)
         for chat in chats:
             chat_id = _text(chat.get("chat_id"))
@@ -42,15 +48,19 @@ class ChatSynchronizer:
                 continue
             try:
                 result = _add_results(result, self._sync_chat(chat_id, _chat_name(chat)))
-            except Exception:
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
                 result = result.add(failed=1)
         return result
 
     def _sync_chat(self, chat_id: str, chat_name: str) -> SyncResult:
         existing = {source.source_key: source for source in self._storage.list_sources()}
         cursor = self._storage.get_checkpoint(f"chat:{chat_id}")
-        start = _cursor_time(cursor) or self._settings.chat_history_start
+        # The message API filters by creation time, not revision time. Re-reading the
+        # configured history range is required to discover edits and recalls to old roots.
+        start = self._settings.chat_history_start
         thread_ids = _cursor_thread_ids(cursor)
+        thread_cursors = _cursor_thread_cursors(cursor)
+        thread_seeds: dict[str, tuple[str, str]] = {}
         migrated_thread_discovery = _needs_thread_discovery(cursor)
         result = SyncResult()
         latest: tuple[str, str] | None = None
@@ -72,6 +82,8 @@ class ChatSynchronizer:
                 thread_id = _text(message.get("thread_id"))
                 if thread_id:
                     thread_ids.add(thread_id)
+                    if thread_id not in thread_cursors and candidate is not None:
+                        thread_seeds[thread_id] = _newer(thread_seeds.get(thread_id), candidate) or candidate
             if not has_more:
                 break
             if not next_token:
@@ -80,13 +92,24 @@ class ChatSynchronizer:
             page_token = next_token
 
         for thread_id in sorted(thread_ids):
-            thread_result, _ = self._sync_thread(thread_id, chat_id, chat_name, existing)
+            thread_result, thread_latest = self._sync_thread(
+                thread_id,
+                chat_id,
+                chat_name,
+                existing,
+            )
             result = _add_results(result, thread_result)
+            latest_thread_cursor = _newer(thread_cursors.get(thread_id), thread_latest)
+            if latest_thread_cursor is None:
+                latest_thread_cursor = thread_seeds.get(thread_id)
+            if latest_thread_cursor is not None:
+                thread_cursors[thread_id] = latest_thread_cursor
 
         checkpoint = _chat_checkpoint(
             cursor,
             latest,
             thread_ids,
+            thread_cursors,
             thread_discovery_complete=migrated_thread_discovery,
         )
         if checkpoint is not None:
@@ -124,6 +147,8 @@ class ChatSynchronizer:
         page_token: str | None = None
         seen_page_tokens: set[str] = set()
         while True:
+            # lark-cli does not support a thread --start filter. Re-read every
+            # known thread and rely on message-key upserts for idempotency.
             page = self._feishu.list_thread_messages(thread_id, page_token=page_token)
             messages, has_more, next_token = _message_page(page)
             for message in messages:
@@ -156,9 +181,11 @@ class ChatSynchronizer:
         if not message_id:
             raise ValueError("Feishu message is missing its message_id.")
         sent_at = _message_time(message)
+        revision = _message_revision(message) or sent_at
+        deleted = _message_deleted(message)
         actual_thread_id = thread_id or _text(message.get("thread_id")) or None
         message_type = _text(message.get("msg_type")) or "unknown"
-        text = _message_text(message) if message_type == "text" else ""
+        text = _message_text(message) if message_type == "text" and not deleted else ""
         metadata: dict[str, Any] = {
             "chat_id": chat_id,
             "chat_name": chat_name,
@@ -167,8 +194,12 @@ class ChatSynchronizer:
             "thread_id": actual_thread_id,
             "url": _text(message.get("url")) or f"https://feishu.cn/im/message/{message_id}",
             "message_type": message_type,
+            "revision": revision,
+            "deleted": deleted,
         }
-        if message_type != "text":
+        if revision:
+            metadata["source_updated_at"] = revision
+        if message_type != "text" and not deleted:
             metadata["raw_content"] = message.get("content")
         source = SourceRecord(
             source_key=f"message:{message_id}",
@@ -176,7 +207,7 @@ class ChatSynchronizer:
             title=f"{chat_name} · {_sender(message.get('sender'))}",
             text_content=text,
             metadata=metadata,
-            active=True,
+            active=not deleted,
         )
         outcome = _outcome(existing.get(source.source_key), source)
         self._storage.upsert_source(source)
@@ -191,10 +222,10 @@ def _chat_pages(fetch: Any) -> list[dict[str, Any]]:
     while True:
         page = fetch(page_token=page_token)
         if not isinstance(page, dict):
-            raise ValueError("Feishu chat page must be an object.")
+            raise TypeError("Feishu chat page must be an object.")
         values = page.get("items", page.get("chats", []))
         if not isinstance(values, list):
-            raise ValueError("Feishu chat page must contain chats.")
+            raise TypeError("Feishu chat page must contain chats.")
         chats.extend(value for value in values if isinstance(value, dict))
         if not page.get("has_more"):
             return chats
@@ -206,10 +237,10 @@ def _chat_pages(fetch: Any) -> list[dict[str, Any]]:
 
 def _message_page(page: Any) -> tuple[list[dict[str, Any]], bool, str | None]:
     if not isinstance(page, dict):
-        raise ValueError("Feishu message page must be an object.")
+        raise TypeError("Feishu message page must be an object.")
     values = page.get("messages", page.get("items", []))
     if not isinstance(values, list):
-        raise ValueError("Feishu message page must contain messages.")
+        raise TypeError("Feishu message page must contain messages.")
     return (
         [value for value in values if isinstance(value, dict)],
         bool(page.get("has_more")),
@@ -243,6 +274,25 @@ def _message_time(message: dict[str, Any]) -> str:
     return _text(message.get("create_time")) or _text(message.get("sent_at"))
 
 
+def _message_revision(message: dict[str, Any]) -> str:
+    return (
+        _text(message.get("update_time"))
+        or _text(message.get("updated_at"))
+        or _text(message.get("revision"))
+    )
+
+
+def _message_deleted(message: dict[str, Any]) -> bool:
+    return any(
+        _truthy(message.get(key))
+        for key in ("deleted", "is_deleted", "recalled", "is_recalled")
+    )
+
+
+def _truthy(value: Any) -> bool:
+    return value is True or value == 1 or (isinstance(value, str) and value.lower() == "true")
+
+
 def _sender(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -268,6 +318,20 @@ def _cursor_thread_ids(cursor: Any) -> set[str]:
     return {_text(value) for value in values if _text(value)}
 
 
+def _cursor_thread_cursors(cursor: Any) -> dict[str, tuple[str, str]]:
+    if not isinstance(cursor, dict) or not isinstance(cursor.get("thread_cursors"), dict):
+        return {}
+    thread_cursors: dict[str, tuple[str, str]] = {}
+    for thread_id, value in cursor["thread_cursors"].items():
+        if not isinstance(value, dict):
+            continue
+        sent_at = _text(value.get("sent_at"))
+        message_id = _text(value.get("message_id"))
+        if sent_at or message_id:
+            thread_cursors[_text(thread_id)] = (sent_at, message_id)
+    return {thread_id: value for thread_id, value in thread_cursors.items() if thread_id}
+
+
 def _needs_thread_discovery(cursor: Any) -> bool:
     if not isinstance(cursor, dict) or cursor.get("thread_discovery_complete") is True:
         return False
@@ -280,6 +344,7 @@ def _chat_checkpoint(
     cursor: Any,
     latest: tuple[str, str] | None,
     thread_ids: set[str],
+    thread_cursors: dict[str, tuple[str, str]],
     *,
     thread_discovery_complete: bool = False,
 ) -> dict[str, Any] | None:
@@ -294,8 +359,14 @@ def _chat_checkpoint(
         checkpoint["sent_at"] = sent_at
     if message_id:
         checkpoint["message_id"] = message_id
-    if thread_ids:
-        checkpoint["thread_ids"] = sorted(thread_ids)
+    checkpoint["thread_ids"] = sorted(thread_ids)
+    saved_thread_cursors = {
+        thread_id: {"sent_at": sent_at, "message_id": message_id}
+        for thread_id, (sent_at, message_id) in sorted(thread_cursors.items())
+        if thread_id in thread_ids and sent_at and message_id
+    }
+    if saved_thread_cursors:
+        checkpoint["thread_cursors"] = saved_thread_cursors
     if thread_discovery_complete or previous.get("thread_discovery_complete") is True:
         checkpoint["thread_discovery_complete"] = True
     return checkpoint
